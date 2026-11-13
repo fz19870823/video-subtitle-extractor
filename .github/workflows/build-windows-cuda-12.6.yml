@@ -36,7 +36,7 @@ jobs:
       with:
         python-version: '3.12'
         cache: 'pip' # caching pip dependencies
-    - run: pip install paddlepaddle-gpu==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+    - run: pip install paddlepaddle-gpu==3.3.1 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
     - run: pip install -r requirements.txt
     - run: pip freeze > requirements.txt
     - run: pip install QPT==1.0b8 setuptools

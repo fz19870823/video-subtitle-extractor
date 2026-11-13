@@ -32,9 +32,9 @@ def main():
         sub_modules.append(CopyCUDAPackage(cuda_version=args.cuda))
         sub_modules.append(CustomPackage("numpy==1.26.4", deploy_mode=DEFAULT_DEPLOY_MODE))
     elif args.cuda == "11.8":
-        sub_modules.append(CustomPackage("paddlepaddle-gpu==3.0.0", deploy_mode=DEFAULT_DEPLOY_MODE, find_links=PYPI_PIP_SOURCE, opts="--index-url https://www.paddlepaddle.org.cn/packages/stable/cu118/ "))
+        sub_modules.append(CustomPackage("paddlepaddle-gpu==3.3.1", deploy_mode=DEFAULT_DEPLOY_MODE, find_links=PYPI_PIP_SOURCE, opts="--index-url https://www.paddlepaddle.org.cn/packages/stable/cu118/ "))
     elif args.cuda == "12.6":
-        sub_modules.append(CustomPackage("paddlepaddle-gpu==3.0.0", deploy_mode=DEFAULT_DEPLOY_MODE, find_links=PYPI_PIP_SOURCE, opts="--index-url https://www.paddlepaddle.org.cn/packages/stable/cu126/ "))
+        sub_modules.append(CustomPackage("paddlepaddle-gpu==3.3.1", deploy_mode=DEFAULT_DEPLOY_MODE, find_links=PYPI_PIP_SOURCE, opts="--index-url https://www.paddlepaddle.org.cn/packages/stable/cu126/ "))
 
     if os.getenv("QPT_Action") == "True":
         set_default_pip_source(PYPI_PIP_SOURCE)

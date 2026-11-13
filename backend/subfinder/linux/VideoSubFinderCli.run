@@ -1,5 +1,4 @@
 #!/bin/sh
-cd ${0%/*}
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$PWD:/lib64
-chmod +x ./VideoSubFinderCli
-./VideoSubFinderCli "$@"
+VSF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1
+export LD_LIBRARY_PATH="$VSF_DIR/lib"
+exec "$VSF_DIR/VideoSubFinderCli" "$@"

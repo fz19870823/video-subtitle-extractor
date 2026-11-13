@@ -92,14 +92,22 @@ class OcrRecogniser:
             device = 'cpu'
 
         kwargs = dict(
-            text_detection_model_dir=model_config.DET_MODEL_PATH,
-            text_recognition_model_dir=model_config.REC_MODEL_PATH,
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
             text_rec_score_thresh=0,
             device=device,
         )
+        # Paddle 3.x 在 CPU 上启用 oneDNN + PIR 新执行器时会抛
+        # NotImplementedError: ConvertPirAttribute2RuntimeAttribute not support，
+        # 关闭 mkldnn 可绕过（GPU 不走该分支，无需设置）
+        if device == 'cpu':
+            kwargs['enable_mkldnn'] = False
+        # 本地有模型目录时优先使用本地模型；缺失时不传 dir，PaddleOCR 会按 model_name 自动下载
+        if model_config.DET_MODEL_PATH:
+            kwargs['text_detection_model_dir'] = model_config.DET_MODEL_PATH
+        if model_config.REC_MODEL_PATH:
+            kwargs['text_recognition_model_dir'] = model_config.REC_MODEL_PATH
         if model_config.DET_MODEL_NAME:
             kwargs['text_detection_model_name'] = model_config.DET_MODEL_NAME
         if model_config.REC_MODEL_NAME:

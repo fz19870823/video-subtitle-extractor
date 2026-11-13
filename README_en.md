@@ -76,14 +76,14 @@ Key features:
 
 > NVIDIA 50-series GPUs require CUDA 12.8.0 or above, but Paddle 3.3.1 does not yet support it, so the DirectML universal version is recommended.
 
-**Recognition Mode Selection**:
+**Recognition Mode Selection** (OCR uses PP-OCRv6; small ≈ 7.7M params, medium ≈ 34.5M params):
 
-| Mode | GPU | OCR Model Size | Subtitle Detection Engine | Notes |
+| Mode | GPU | OCR Model | Subtitle Detection Engine | Notes |
 |------|-----|----------------|---------------------------|-------|
-| Fast | Yes/No | Mini | VideoSubFinder | |
-| Auto | Yes | Large | VideoSubFinder | Recommended |
-| Auto | No | Mini | VideoSubFinder | Recommended |
-| Precise | Yes/No | Large | VSE | Very slow |
+| Fast | Yes/No | PP-OCRv6_small | VideoSubFinder | |
+| Auto | Yes | PP-OCRv6_medium | VideoSubFinder | Recommended |
+| Auto | No | PP-OCRv6_small | VideoSubFinder | Recommended |
+| Precise | Yes/No | PP-OCRv6_medium | VSE | Very slow |
 
 > VideoSubFinder is the subtitle detection engine on Windows/Linux/macOS.
 
@@ -209,7 +209,45 @@ This project supports four runtime modes: CUDA (NVIDIA GPU acceleration), CPU (n
   pip install -r requirements.txt
   ```
 
-#### 5. Run the Program
+#### 5. Download OCR Models (PP-OCRv6)
+
+The project uses PP-OCRv6 inference models. Download them into `backend/models/V6/`:
+
+```shell
+# Default: small + medium (detection + recognition, ~165MB)
+python backend/tools/download_models.py
+
+# A single tier (tiny = fastest, medium = most accurate)
+python backend/tools/download_models.py --tier tiny
+
+# Add --no-proxy if your proxy breaks the download
+python backend/tools/download_models.py --no-proxy
+```
+
+Tier mapping: Fast → `small`, Precise → `medium`, Auto → `medium` on GPU and `small` on CPU. You can force a tier with the `VSE_OCR_TIER` environment variable (e.g. `set VSE_OCR_TIER=tiny && python gui.py` on Windows).
+
+> Korean, Arabic, Cyrillic, Devanagari and Thai are not covered by PP-OCRv6 yet; the code automatically falls back to the PP-OCRv5 language models in `backend/models/V5/`.
+
+#### 6. Subtitle Detection Engine (VideoSubFinder 6.10.x)
+
+The upstream project stopped at 6.10 (April 2023). The maintained 6.10.x series now comes from [eritpchy/videosubfinder-cli](https://github.com/eritpchy/videosubfinder-cli), and the bundled binaries are its 6.10.7 release (statically linked CPU builds, no separate OpenCV/FFmpeg/VC++ runtime needed):
+
+- `backend/subfinder/windows/`: `VideoSubFinderCli.exe`
+- `backend/subfinder/linux/`: `VideoSubFinderCli` + `VideoSubFinderCli.run`
+- `backend/subfinder/macos/`: still the 5.60 build (the new macOS package is over 240MB and has not been swapped yet)
+
+The bundled builds are CPU-only, so `--use_cuda` is not passed. If you replace them with the CUDA package (e.g. `videosubfinder-cli-linux-cuda12-x64`), enable it with `VSE_VSF_USE_CUDA=1`:
+
+```shell
+# Windows
+set VSE_VSF_USE_CUDA=1 && python gui.py
+# Linux
+VSE_VSF_USE_CUDA=1 python gui.py
+```
+
+> Only the timing is needed, so the CLI runs with `-dsi` (no subtitle frame images on disk) and OCR grabs frames from the source video by timestamp. Detection parameters live in `backend/subfinder/*/settings/general.cfg`; `min_sum_color_diff = 0` and `sub_frame_length = 6` are kept at the 5.60 values to preserve detection sensitivity.
+
+#### 7. Run the Program
 
 - Run the GUI version:
 

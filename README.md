@@ -75,13 +75,13 @@ Video-subtitle-extractor (VSE) 是一款将视频中的硬字幕提取为外挂�
 
 > NVIDIA 50系显卡需要使用cuda12.8.0及以上版本, 但Paddle3.3.1目前仍未支持，所以建议使用Directml通用版本
 
-**识别模式选择说明**：
-|    模式名称    | GPU | OCR模型尺寸 | 字幕检测引擎 | 备注 |
+**识别模式选择说明**（OCR 模型使用 PP-OCRv6，small ≈ 7.7M 参数，medium ≈ 34.5M 参数）：
+|    模式名称    | GPU | OCR模型 | 字幕检测引擎 | 备注 |
 |---------------|-----|---------|------|------|
-|    快速        | 有/无 | 迷你  | VideoSubFinder | |
-|    自动  | 有| 大  | VideoSubFinder |  推荐   |
-|    自动  | 无| 迷你  | VideoSubFinder |  推荐   |
-|    精准        | 有/无| 大  | VSE | 非常慢 |
+|    快速        | 有/无 | PP-OCRv6_small  | VideoSubFinder | |
+|    自动  | 有| PP-OCRv6_medium  | VideoSubFinder |  推荐   |
+|    自动  | 无| PP-OCRv6_small  | VideoSubFinder |  推荐   |
+|    精准        | 有/无| PP-OCRv6_medium  | VSE | 非常慢 |
 > Windows/Linux/MacOS环境下字幕检测引擎都是VideoSubFinder
 
 ## 演示
@@ -205,7 +205,54 @@ cd <源码所在目录>
   pip install -r requirements.txt
   ```
 
-#### 5. 运行程序
+#### 5. 下载 OCR 模型（PP-OCRv6）
+
+项目使用 PP-OCRv6 推理模型，模型文件较大，可通过脚本下载到 `backend/models/V6/`：
+
+```shell
+# 下载默认使用的 small + medium 两档（检测 + 识别，约 165MB）
+python backend/tools/download_models.py
+
+# 只下载某一档（tiny 最快，medium 最准）
+python backend/tools/download_models.py --tier tiny
+python backend/tools/download_models.py --tier small
+python backend/tools/download_models.py --tier medium
+
+# 国内网络受代理影响时可加 --no-proxy
+python backend/tools/download_models.py --no-proxy
+```
+
+档位与识别模式的对应关系：快速 → `small`，精准 → `medium`，自动 → GPU 用 `medium`、CPU 用 `small`。也可以用环境变量强制指定档位（例如 CPU 机器追求速度时用 `tiny`）：
+
+```shell
+# Windows
+set VSE_OCR_TIER=tiny && python gui.py
+# Linux / macOS
+VSE_OCR_TIER=tiny python gui.py
+```
+
+> 极少数语言（韩语、阿拉伯语、俄语等西里尔语系、印地语等天城文、泰语等）PP-OCRv6 尚未覆盖，代码会自动回退到 `backend/models/V5/` 中的 PP-OCRv5 专用模型。
+
+#### 6. 字幕检测引擎（VideoSubFinder 6.10.x）
+
+官方仓库最后更新停留在 6.10（2023 年），目前维护中的 6.10.x 分支由 [eritpchy/videosubfinder-cli](https://github.com/eritpchy/videosubfinder-cli) 提供，项目随包携带的就是它的 6.10.7 版本（CPU 静态链接，无需额外安装 OpenCV/FFmpeg/VC++ 运行库）：
+
+- `backend/subfinder/windows/`：`VideoSubFinderCli.exe`
+- `backend/subfinder/linux/`：`VideoSubFinderCli` + `VideoSubFinderCli.run`
+- `backend/subfinder/macos/`：仍为 5.60 版（新版 macOS 包体积超过 240MB，暂未替换）
+
+随包为 CPU 版，调用时不传 `--use_cuda`。如果你自行替换成 CUDA 版（如 `videosubfinder-cli-linux-cuda12-x64`），设置环境变量 `VSE_VSF_USE_CUDA=1` 即可启用 GPU：
+
+```shell
+# Windows
+set VSE_VSF_USE_CUDA=1 && python gui.py
+# Linux
+VSE_VSF_USE_CUDA=1 python gui.py
+```
+
+> 字幕检测只需要时间轴，因此运行时带 `-dsi`（不落盘字幕帧图像），OCR 直接按时间从原视频取帧。检测参数见 `backend/subfinder/*/settings/general.cfg`，其中 `min_sum_color_diff = 0`、`sub_frame_length = 6` 是为保持与 5.60 一致的检测灵敏度而保留的旧值。
+
+#### 7. 运行程序
 
 - 运行图形化界面版本（GUI）
 

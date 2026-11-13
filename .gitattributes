@@ -1,0 +1,8 @@
+# VideoSubFinder 随包二进制与配置：禁止换行转换，保证跨平台一致
+backend/subfinder/**/*.exe binary
+backend/subfinder/**/*.dll binary
+backend/subfinder/linux/VideoSubFinderCli binary
+backend/subfinder/macos/VideoSubFinderCli binary
+backend/subfinder/**/*.run text eol=lf
+backend/subfinder/**/settings/*.cfg text eol=lf
+backend/subfinder/**/licenses/** text eol=lf

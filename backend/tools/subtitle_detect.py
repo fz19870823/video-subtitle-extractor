@@ -18,9 +18,16 @@ class SubtitleDetect:
         hardware_accelerator = HardwareAccelerator.instance()
         model_config = PaddleModelConfig(hardware_accelerator)
         # 使用 TextDetection 公开 API（PaddleOCR 3.x）
-        kwargs = {'model_dir': model_config.DET_MODEL_PATH}
+        kwargs = {}
+        if model_config.DET_MODEL_PATH:
+            kwargs['model_dir'] = model_config.DET_MODEL_PATH
         if model_config.DET_MODEL_NAME:
             kwargs['model_name'] = model_config.DET_MODEL_NAME
+        if hardware_accelerator.has_cuda():
+            kwargs['device'] = 'gpu:0'
+        else:
+            # 同 ocr.py：CPU 上关闭 oneDNN，规避 Paddle 3.x 的 PIR 属性转换报错
+            kwargs['enable_mkldnn'] = False
         self.text_detector = TextDetection(**kwargs)
 
     def detect_subtitle(self, img):

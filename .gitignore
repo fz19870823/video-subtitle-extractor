@@ -363,5 +363,6 @@ $RECYCLE.BIN/
 /backend/models/**/*.onnx
 /config/config.json
 /.claude/
+/.workbuddy/
 /installer_output/
 /entitlements.plist
