@@ -226,7 +226,9 @@ python backend/tools/download_models.py --no-proxy
 
 Tier mapping: Fast → `small`, Precise → `medium`, Auto → `medium` on GPU and `small` on CPU. You can force a tier with the `VSE_OCR_TIER` environment variable (e.g. `set VSE_OCR_TIER=tiny && python gui.py` on Windows).
 
-> Korean, Arabic, Cyrillic, Devanagari and Thai are not covered by PP-OCRv6 yet; the code automatically falls back to the PP-OCRv5 language models in `backend/models/V5/`.
+> **PP-OCRv5 is no longer supported**: `backend/models/` only ships PP-OCRv6, the old V5 language-specific models (~254MB) have been removed.
+> Korean, Arabic, Cyrillic, Devanagari, Thai, Greek, Tamil, Telugu, Kannada and Georgian have no dedicated v6 models and now use the
+> multilingual v6 model instead, so accuracy for those languages is lower (a hint is printed in the startup log).
 
 #### 6. Subtitle Detection Engine (VideoSubFinder 6.10.x)
 

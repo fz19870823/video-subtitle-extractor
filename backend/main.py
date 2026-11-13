@@ -123,6 +123,9 @@ class SubtitleExtractor:
         # 打印加载模型信息
         det_desc, rec_desc = [part.strip() for part in self.model_config.describe().split('|', 1)]
         self.append_output(f"  DET: {det_desc}  |  REC: {rec_desc}")
+        # 当前语言没有 v6 专用模型时给出提示
+        if self.model_config.LANG_WARNING:
+            self.append_output(f"  {self.model_config.LANG_WARNING}")
         self.append_output('-----------------------------')
         # 打印视频帧提取开始提示
         self.append_output(tr['Main']['StartProcessFrame'])

@@ -231,7 +231,9 @@ set VSE_OCR_TIER=tiny && python gui.py
 VSE_OCR_TIER=tiny python gui.py
 ```
 
-> 极少数语言（韩语、阿拉伯语、俄语等西里尔语系、印地语等天城文、泰语等）PP-OCRv6 尚未覆盖，代码会自动回退到 `backend/models/V5/` 中的 PP-OCRv5 专用模型。
+> **已不再支持 PP-OCRv5**：`backend/models/` 中只保留 PP-OCRv6，旧版 V5 语言专用模型已移除（约 254MB）。
+> 韩语、阿拉伯语系、西里尔语系、天城文、泰语、希腊语、泰米尔语、泰卢固语、卡纳达语、格鲁吉亚语
+> 没有 v6 专用模型，会统一使用 v6 多语种通用模型，这些语言的识别准确率会偏低（启动日志会给出提示）。
 
 #### 6. 字幕检测引擎（VideoSubFinder 6.10.x）
 
