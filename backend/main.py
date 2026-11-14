@@ -307,7 +307,7 @@ class SubtitleExtractor:
         reuse_frames = 0
 
         def dbg(*args):
-            if dbg_fh is not None:
+            if dbg_fh is not None and not dbg_fh.closed:
                 print(*args, file=dbg_fh, flush=True)
 
         # frame 可能是整帧（origin=(0,0)）或字幕条局部图（origin 为它在整帧中的左上角），
@@ -368,6 +368,11 @@ class SubtitleExtractor:
                         break
             else:
                 has_subtitle = len(dt_boxes) > 0
+            # 选区内只有噪声框（logo、省略号）的帧不算字幕，否则会产出 'T' / '?' / 'oo'
+            # 这类 1 帧垃圾条目
+            if has_subtitle and entry is not None and self.NOISE_FILTER \
+                    and self._is_noise_text(entry['text']):
+                has_subtitle = False
             # 检测到包含字幕帧的起始帧号与结束帧号
             if has_subtitle:
                 # 检测到字幕时，如果列表为空，则为字幕头
@@ -428,7 +433,8 @@ class SubtitleExtractor:
             while len(ocr_args_list) > 1:
                 total_frame_count, ocr_info_frame_no = ocr_args_list.pop(0)
                 # 必须按入队的帧号取缓存，否则会把当前帧的文本贴到别的帧号上（文本与时间轴错配）
-                predict_result = compare_ocr_result_cache.get(ocr_info_frame_no)
+                predict_result = self._take_flush_result(
+                    compare_ocr_result_cache, entry_by_frame, ocr_info_frame_no, dbg)
                 if predict_result is not None:
                     dt_box, rec_res = predict_result['dt_box'], predict_result['rec_res']
                 else:
@@ -445,7 +451,8 @@ class SubtitleExtractor:
             dbg_fh.close()
         while len(ocr_args_list) > 0:
             total_frame_count, ocr_info_frame_no = ocr_args_list.pop(0)
-            predict_result = compare_ocr_result_cache.get(ocr_info_frame_no)
+            predict_result = self._take_flush_result(
+                compare_ocr_result_cache, entry_by_frame, ocr_info_frame_no, dbg)
             if predict_result is not None:
                 dt_box, rec_res = predict_result['dt_box'], predict_result['rec_res']
             else:
@@ -859,8 +866,15 @@ class SubtitleExtractor:
         RawInfo = namedtuple('RawInfo', 'no content')
         content_list = []
         for line in lines:
-            frame_no = line.split('\t')[0]
-            content = line.split('\t')[2]
+            parts = line.split('\t')
+            if len(parts) < 3:
+                continue
+            frame_no = parts[0]
+            content = parts[2]
+            # 兜底：子进程自行识别的行（框越界导致主进程没给结果）没经过 _filter_noise_boxes，
+            # 这里丢掉纯噪声行，避免 'T' / 'oo' / logo 文本变成字幕条目
+            if self.NOISE_FILTER and self._is_noise_text(content):
+                continue
             content_list.append(RawInfo(frame_no, content))
         # 去重后的字幕列表
         unique_subtitle_list = []
@@ -923,6 +937,11 @@ class SubtitleExtractor:
         with open(self.raw_subtitle_path, mode='w', encoding='utf-8') as f:
             for frame_no, (coordinate, contents) in grouped.items():
                 merged = ' '.join(contents).replace('\n', ' ')
+                if self.NOISE_FILTER:
+                    # 同一帧有多个框时上面是按 ' '.join 拼的，如果两个框识别出同一句，
+                    # 拼完就是 'A A'。主进程的 _filter_noise_boxes 只处理单帧内的框，
+                    # 这里再折一次，覆盖子进程自行识别（框越界、缓存未命中）写入的行。
+                    merged = self._collapse_repeat(merged)
                 if not merged.endswith('\n'):
                     merged += '\n'
                 merged = unicodedata.normalize('NFKC', merged)
@@ -1009,7 +1028,55 @@ class SubtitleExtractor:
                 ymax = coordinate[3]
                 if sub_area.xmin <= xmin and xmax <= sub_area.xmax and sub_area.ymin <= ymin and ymax <= sub_area.ymax:
                     area_text.append(content[0])
+        if self.NOISE_FILTER and len(area_text) > 1:
+            kept = [t for t in area_text if not self._is_noise_text(t)]
+            # 全是噪声时原样返回：是否算作字幕由调用方的 _is_noise_text 统一判定
+            if kept:
+                area_text = kept
         return area_text
+
+    @staticmethod
+    def _is_noise_text(text):
+        """
+        判断一条识别结果是不是噪声（省略号被识成 'oo'、logo 被认成 'T' / '?'）。
+        含中日文或数字 → 一定是有效内容；纯拉丁/符号再按长度和重复度收窄，
+        避免误伤 'OK' 这类真实短字幕。
+        """
+        t = text.replace(' ', '').strip()
+        if not t:
+            return True
+        for ch in t:
+            if ch.isdigit() or '\u3040' <= ch <= '\u30ff' or '\u4e00' <= ch <= '\u9fff':
+                return False
+        if len(t) == 1:
+            return True                      # 'T' / '?' / 'M'
+        if len(t) <= 4 and len(set(t)) == 1:
+            return True                      # 'oo' / 'CC' / '....'
+        if not any(ch.isalnum() for ch in t):
+            return True                      # '...' / '—' / '·'
+        return False
+
+    @staticmethod
+    def _take_flush_result(compare_cache, entry_by_frame, frame_no, dbg=None):
+        """
+        取出某个帧号的识别结果，用于写给 OCR 子进程。
+        compare 缓存只保留最近 10 帧，而条目的**结束帧**往往在 flush 时已被淘汰，此时退回
+        持久的 entry_by_frame：否则子进程会重新 seek+解码+整帧 OCR，既慢，又会因为整帧 OCR
+        的 sub_area 越界判定与主进程不同而丢掉该结束帧 —— raw 少了结束帧行，
+        _remove_duplicate_subtitle 的“只有一帧的条目”兜底就会把结束时间拉长到下一帧起始
+        （实测 S01E01 20:05 的「黑子」被从 1s 拉到 4.4s）。
+        """
+        res = compare_cache.get(frame_no)
+        if res is None:
+            res = entry_by_frame.get(frame_no)
+        # 主进程一个框都没给出（框整体越出字幕选区）时必须退回 None，让子进程自己识别这一帧。
+        # 直接传空框会让这一帧被静默跳过：实测 S01E01 17:34 的「明明还是白天」和 OP 2:59
+        # 整段因此消失。
+        if res is not None and not res.get('dt_box'):
+            res = None
+        if dbg is not None:
+            dbg(f'[FLUSH] f={frame_no} cache_hit={res is not None}')
+        return res
 
     # ---- 签名跳帧参数 ----
     # 字幕条降采样签名中，灰度差超过 SIGNATURE_DIFF_GRAY 的像素占比低于 SIGNATURE_MAX_FRAC
@@ -1021,6 +1088,20 @@ class SubtitleExtractor:
     # 可用环境变量 VSE_SIG_MAX_FRAC 覆盖（设为 0 可完全关闭跳帧）。
     SIGNATURE_DIFF_GRAY = 16
     SIGNATURE_MAX_FRAC = float(os.environ.get('VSE_SIG_MAX_FRAC', '0.003'))
+
+    # ---- 同行框合并 / 识别噪声过滤 ----
+    # det 会把一行字幕拆成 1~2 个框，且框数会在 1↔2 之间逐帧跳变，第二个框常常只是省略号
+    # 或标点，被 rec 成 'oo' / '...' 之类。后果有两个（S01E01 整集实测）：
+    #   ① 拼接文本在 '就算是我' ↔ '就算是我oo' 之间反复切换，Levenshtein ratio 恰好 =0.8
+    #      卡在 thresholdTextSimilarity 的边界上，状态机每次跳变都断开条目 → 一条字幕被切成
+    #      数条 <500ms 碎片（正片占 16%，OP 占 54%）；
+    #   ② 拆开的两个框各自识别出同一行内容时，拼出重复文本
+    #      （'振り返ることしか  振り返ることしか'）。
+    # 修法：① 同行水平相邻的框先合并成一个框再识别（根除拆框与重复拼接）；
+    #       ② 识别结果里的纯符号/极短拉丁噪声框丢弃（消除 'oo' / 'T' / '?' 造成的文本抖动）。
+    # 环境变量可分别关闭，便于回归对比：VSE_MERGE_LINE=0 / VSE_NOISE_FILTER=0
+    MERGE_SAME_LINE = os.environ.get('VSE_MERGE_LINE', '1') == '1'
+    NOISE_FILTER = os.environ.get('VSE_NOISE_FILTER', '1') == '1'
 
     # ---- 管道解码参数 ----
     # 精确模式只需要字幕条上的像素，整帧 4K 每帧 24MB 的 YUV→BGR 转换和 Mat 拷贝是纯浪费。
@@ -1218,22 +1299,102 @@ class SubtitleExtractor:
         dt_boxes[:, :, 1] += y0 + oy
         # 合并高度重叠的框：det 偶尔把一行字幕拆成两个重叠框，不合并会拼出重复文本
         dt_boxes = self._dedup_polys(dt_boxes)
+        # 再合并同一行内水平相邻的框：拆框不重叠时 _dedup_polys 不生效，但会让文本在
+        # 两段/整行之间来回跳变，把一条字幕切碎
+        if self.MERGE_SAME_LINE:
+            dt_boxes = self._merge_same_line_polys(
+                dt_boxes, valid_rect=(sub_area.xmin, sub_area.ymin, sub_area.xmax, sub_area.ymax))
         return dt_boxes, elapse
 
     @staticmethod
-    def _dedup_polys(dt_boxes, overlap_thresh=0.6):
+    def _poly_rect(poly):
+        """
+        多边形的 AABB，返回 [xmin, ymin, xmax, ymax]（float）。
+        必须与 get_coordinates() 用同一套定义：det 输出的框常带轻微倾斜，
+        取“所有点的 min/max”会比对角点定义宽出十几像素，合并后可能越过字幕选区边界，
+        导致本来能识别的帧被 _ocr_in_area 判为越界而整帧丢弃。
+        """
+        (x1, y1) = poly[0]
+        (x2, y2) = poly[1]
+        (x3, y3) = poly[2]
+        (x4, y4) = poly[3]
+        xmin = float(max(x1, x4))
+        xmax = float(min(x2, x3))
+        ymin = float(max(y1, y2))
+        ymax = float(min(y3, y4))
+        # 极端情况下退化框（xmax<=xmin）退回全点范围，避免出现负宽高
+        if xmax <= xmin or ymax <= ymin:
+            xs = [float(p[0]) for p in poly]
+            ys = [float(p[1]) for p in poly]
+            return [min(xs), min(ys), max(xs), max(ys)]
+        return [xmin, ymin, xmax, ymax]
+
+    @classmethod
+    def _merge_same_line_polys(cls, dt_boxes, v_overlap_thresh=0.6, gap_ratio=0.8, valid_rect=None):
+        """
+        合并同一行内水平相邻的检测框（det 把一句话拆成多个框时使用）。
+        两个框同时满足以下条件才合并：
+          1. 垂直重叠高度 / 较矮框高度 > v_overlap_thresh → 判定在同一行
+          2. 水平间隙 < min(两框高度) * gap_ratio → 判定是被拆开的同一句话
+             （双语字幕的上下一行垂直不重叠，走不到这里，不会被误合并）
+          3. 两个框都在字幕选区内（valid_rect）。越界框一旦被并进来，合并后的外接矩形
+             会越过选区边界，整帧会被 _ocr_in_area 判为越界丢弃 —— 连带丢掉本来能用的
+             那一半文本（实测预告段因此丢了「一緒に」）。
+        合并结果取外接矩形并写成 4 点多边形，按 xmin 输出。
+        """
+        if dt_boxes is None or len(dt_boxes) < 2:
+            return dt_boxes
+        rects = [cls._poly_rect(poly) for poly in dt_boxes]
+        if valid_rect is not None:
+            vx0, vy0, vx1, vy1 = valid_rect
+            inside = [r[0] >= vx0 and r[2] <= vx1 and r[1] >= vy0 and r[3] <= vy1 for r in rects]
+        else:
+            inside = [True] * len(rects)
+        order = sorted(range(len(rects)), key=lambda i: rects[i][0])
+        used = [False] * len(rects)
+        merged = []
+        for i in order:
+            if used[i]:
+                continue
+            used[i] = True
+            ax0, ay0, ax1, ay1 = rects[i]
+            can_merge = inside[i]
+            # 合并后外接矩形变大，可能又能与更远的框相连，迭代到不再变化
+            grown = True
+            while grown:
+                grown = False
+                for j in order:
+                    if used[j] or not can_merge or not inside[j]:
+                        continue
+                    bx0, by0, bx1, by1 = rects[j]
+                    ah, bh = ay1 - ay0, by1 - by0
+                    if ah <= 0 or bh <= 0:
+                        continue
+                    inter_h = min(ay1, by1) - max(ay0, by0)
+                    if inter_h <= 0 or inter_h / min(ah, bh) <= v_overlap_thresh:
+                        continue
+                    # 相交时为负，表示重叠
+                    gap = max(bx0 - ax1, ax0 - bx1)
+                    if gap > min(ah, bh) * gap_ratio:
+                        continue
+                    ax0, ay0 = min(ax0, bx0), min(ay0, by0)
+                    ax1, ay1 = max(ax1, bx1), max(ay1, by1)
+                    used[j] = True
+                    grown = True
+            merged.append([[ax0, ay0], [ax1, ay0], [ax1, ay1], [ax0, ay1]])
+        if len(merged) == len(rects):
+            return dt_boxes  # 无可合并项，原样返回，保持下游行为完全不变
+        return np.asarray(merged, dtype=dt_boxes.dtype)
+
+    @classmethod
+    def _dedup_polys(cls, dt_boxes, overlap_thresh=0.6):
         """
         合并互相高度重叠的检测框（按交叠面积 / 较小框面积判定），
         合并结果取两者的外接矩形，保持 (N, 4, 2) 的多边形格式。
         """
         if dt_boxes is None or len(dt_boxes) < 2:
             return dt_boxes
-        rects = []
-        for poly in dt_boxes:
-            xs = poly[:, 0]
-            ys = poly[:, 1]
-            # 统一转 float：det 输出的多边形可能是 int16，4K 下面积相乘会溢出
-            rects.append([float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())])
+        rects = [cls._poly_rect(poly) for poly in dt_boxes]
         used = [False] * len(rects)
         merged = []
         for i in range(len(rects)):
@@ -1276,7 +1437,87 @@ class SubtitleExtractor:
                          and sub_area.ymin <= c[2] and c[3] <= sub_area.ymax)]
         if not polys:
             return [], []
-        return self.ocr.recognise_polys(frame, polys, origin=origin)
+        dt_box, rec_res = self.ocr.recognise_polys(frame, polys, origin=origin)
+        if self.NOISE_FILTER:
+            # 必须在 rec 结果这一层过滤：raw.txt 是子进程按 rec_res 直接写的，只在拼接文本层
+            # 过滤会让 'oo' / 'T' 这类噪声照样进 raw，最后仍变成 srt 条目。
+            dt_box, rec_res = self._filter_noise_boxes(dt_box, rec_res)
+        return dt_box, rec_res
+
+    @classmethod
+    def _filter_noise_boxes(cls, dt_box, rec_res):
+        """
+        过滤识别结果里的两类无效框：
+          1. 噪声框：纯符号 / 极短拉丁字符（省略号被识成 'oo'、logo 被认成 'T' / '?'）
+          2. 同行近重复框：det 把一句拆成两个框，两个框各自识别出同一行内容，
+             拼接后就是 '振り返ることしか  振り返ることしか'
+        返回过滤后的 (dt_box, rec_res)，两者保持一一对应。
+        """
+        keep = []
+        for box, (text, score) in zip(dt_box, rec_res):
+            # 先折叠“整句被印了两遍”的识别结果：det 给出一个宽框时，rec 有时会把同一句
+            # 输出两次（'イジョウブ!迷わないで  イジョウブ!迷わないで'），去重只看框间文本
+            # 抓不到这种情况
+            text = cls._collapse_repeat(text)
+            if cls._is_noise_text(text):
+                continue
+            norm = text.replace(' ', '')
+            duplicated = False
+            for kbox, ktext, _ in keep:
+                if not cls._same_line(kbox, box):
+                    continue
+                knorm = ktext.replace(' ', '')
+                # 只有“几乎逐字相同且长度相当”才算重复框。阈值必须收紧：
+                # '泣いていた' 与 '一緒に泣いていた' 的 ratio 就有 0.857，
+                # 用 0.85 会把半句当重复删掉（实测预告段丢了「一緒に」）。
+                if len(norm) < len(knorm) * 0.7 or len(knorm) < len(norm) * 0.7:
+                    continue
+                if ratio(knorm, norm) > 0.95:
+                    duplicated = True
+                    break
+            if not duplicated:
+                keep.append((box, text, score))
+        return [b for b, _, _ in keep], [(t, s) for _, t, s in keep]
+
+    @staticmethod
+    def _collapse_repeat(text):
+        """
+        把“同一句被印了两遍”的识别结果折叠成一份：'A  A' / 'AA' -> 'A'。
+        片源中 ED、OP 常有重复排版，det 也可能给出包含两遍文字的宽框。
+        """
+        t = text.strip()
+        if len(t) < 4:
+            return text
+        # 有分隔符：按分隔符切段，各段完全相同时只留一段；
+        # 或前一半段与后一半段完全相同（两框各识别整句、拼接后中间只有一个空格时的情况：
+        # '一緒に 泣いていた 一緒に 泣いていた'）
+        for sep in ('  ', ' '):
+            parts = [p for p in t.split(sep) if p.strip()]
+            if len(parts) < 2 or len(parts[0]) < 2:
+                continue
+            if len(set(parts)) == 1:
+                return parts[0]
+            half = len(parts) // 2
+            if len(parts) % 2 == 0 and parts[:half] == parts[half:]:
+                return sep.join(parts[:half])
+        # 无分隔符：整串是某个子串的整数倍重复
+        n = len(t)
+        for k in range(2, n // 2 + 1):
+            if n % k == 0 and t == t[:n // k] * k:
+                return t[:n // k]
+        return text
+
+    @staticmethod
+    def _same_line(box1, box2, v_overlap_thresh=0.5):
+        """两个框是否在同一行（垂直重叠比例超过阈值）"""
+        y1 = [p[1] for p in box1]
+        y2 = [p[1] for p in box2]
+        h1 = max(y1) - min(y1)
+        h2 = max(y2) - min(y2)
+        if h1 <= 0 or h2 <= 0:
+            return False
+        inter = min(max(y1), max(y2)) - max(min(y1), min(y2))
+        return inter > 0 and inter / min(h1, h2) > v_overlap_thresh
 
     def _compare_ocr_result(self, result_cache, img1, img1_no, img2, img2_no,
                             img2_polys=None, img2_coordinates=None, img2_origin=(0, 0)):
