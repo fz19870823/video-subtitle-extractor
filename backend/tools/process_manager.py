@@ -70,19 +70,25 @@ class ProcessManager:
     
     def terminate_all(self):
         """并发终止所有管理的进程"""
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = []
-            for process_id, process in list(self.processes.items()):
-                if isinstance(process, int):
-                    futures.append(executor.submit(self.terminate_by_pid, process))
-                else:
-                    futures.append(executor.submit(self.terminate_by_process, process))
-            
-            # 等待所有终止操作完成
-            concurrent.futures.wait(futures)
-        
-        # 清空进程字典
+        pending = list(self.processes.items())
         self.processes.clear()
+        try:
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                futures = []
+                for process_id, process in pending:
+                    if isinstance(process, int):
+                        futures.append(executor.submit(self.terminate_by_pid, process))
+                    else:
+                        futures.append(executor.submit(self.terminate_by_process, process))
+                # 等待所有终止操作完成
+                concurrent.futures.wait(futures)
+        except RuntimeError:
+            # 解释器关闭后无法再提交线程任务，退化为串行终止
+            for process_id, process in pending:
+                if isinstance(process, int):
+                    self.terminate_by_pid(process)
+                else:
+                    self.terminate_by_process(process)
     
     def terminate_by_process(self, process):
         if process is None:

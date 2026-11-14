@@ -366,3 +366,7 @@ $RECYCLE.BIN/
 /.workbuddy/
 /installer_output/
 /entitlements.plist
+
+# 本地调试产物（性能探针用的测试视频切段 / 抽帧目录）
+/railgun_2min.mp4
+/sig_debug/
