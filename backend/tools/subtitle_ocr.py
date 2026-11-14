@@ -92,6 +92,9 @@ def extract_subtitles(data, text_recogniser, img, raw_subtitles,
 
 
 def dump_debug_info(options, line, img, loss_list, ocr_loss_debug_path, sub_area, data):
+    # 精确模式下上游已给出识别结果，这里不再解码视频帧（img 为 None），无法画调试图
+    if img is None:
+        return
     loss = False
     if options.DEBUG_OCR_LOSS and options.REC_CHAR_TYPE in ('ch', 'japan ', 'korea', 'ch_tra'):
         loss = len(line) > 0 and re.search(r'[\u4e00-\u9fa5\u3400-\u4db5\u3130-\u318F\uAC00-\uD7A3\u0800-\u4e00]', line) is None
@@ -195,6 +198,11 @@ def ocr_task_producer(ocr_queue, task_queue, progress_queue, video_path, raw_sub
                 tbar.update(tbar.total - tbar.n)
                 break
             tbar.update(round(current_frame_no - tbar.n))
+            # 如果上游（精确模式）已经给了检测框和识别结果，这一帧就不需要再解码：
+            # 4K 片源随机 seek 一次约 450ms，而这里只是写文件，没必要重复提取。
+            if dt_box is not None and rec_res is not None:
+                ocr_queue.put((current_frame_no, None, dt_box, rec_res))
+                continue
             # 设置当前视频帧
             # 如果total_ms不为空，则使用了VSF提取字幕
             if total_ms is not None:
