@@ -269,11 +269,13 @@ class SubtitleExtractor:
         """
         通过检测字幕区域位置提取字幕帧
 
-        两层优化（输出与逐帧版一致）：
-        1. 签名跳帧：字幕条降采样签名与上一帧相同（差异像素 < 0.3%）时，
+        三层优化（输出与逐帧版一致）：
+        1. 字幕条管道解码：只让 ffmpeg 解码并裁出字幕选区（外扩 16px），
+           不再整帧解码 + YUV→BGR 转换（4K 每帧 15.2ms → 5.5ms）。
+           像素与 OpenCV 逐字节一致（色彩矩阵固定 BT.601，见 DECODE_COLOR）。
+        2. 签名跳帧：字幕条降采样签名与上一帧相同（差异像素 < 0.3%）时，
            复用上一帧的 det/rec 结果，跳过两次模型调用（动画字幕每条持续数十帧）。
-        2. 块内 rec 合并：每 BLOCK 帧为一块，det 逐帧跑（batch 实测无收益），
-           块内所有需要识别的帧合并成一次 rec batch 调用（摊薄单次 ~10ms 的固定开销）。
+        3. rec-only 识别：复用 det 已算出的框只跑识别，跳过重复检测。
         """
         # 当前视频帧的帧号
         current_frame_no = 0
@@ -308,19 +310,15 @@ class SubtitleExtractor:
             if dbg_fh is not None:
                 print(*args, file=dbg_fh, flush=True)
 
-        while self.video_cap.isOpened():
-            ret, frame = self.video_cap.read()
-            # 如果读取视频帧失败（视频读到最后一帧）
-            if not ret:
-                break
-            # 读取视频帧成功
-            current_frame_no += 1
+        # frame 可能是整帧（origin=(0,0)）或字幕条局部图（origin 为它在整帧中的左上角），
+        # 下游一律使用整帧坐标系，靠 origin 换算。
+        for current_frame_no, frame, origin in self._iter_frames():
             tbar.update(1)
 
             # ---- 签名判定：字幕条与上一帧内容相同则复用上一次真实 det/rec 的结果 ----
             if sig_region is None:
-                sig_region = self._signature_region(frame.shape)
-            sig = self._strip_signature(frame, sig_region) if self.SIGNATURE_MAX_FRAC > 0 else None
+                sig_region = self._signature_region((self.frame_height, self.frame_width))
+            sig = self._strip_signature(frame, sig_region, origin) if self.SIGNATURE_MAX_FRAC > 0 else None
             frac = None
             if sig is not None and sig_prev is not None and sig.shape == sig_prev.shape:
                 d = np.abs(sig.astype(np.int16) - sig_prev.astype(np.int16))
@@ -338,14 +336,14 @@ class SubtitleExtractor:
                 reuse_frames += 1
                 dbg(f'[FRAME] f={current_frame_no} REUSE src={src_no} frac={frac:.5f} boxes={len(dt_boxes)}')
             else:
-                dt_boxes, elapse = self._detect_subtitle_in_area(frame)
+                dt_boxes, elapse = self._detect_subtitle_in_area(frame, origin)
                 det_calls += 1
                 coordinate_list = get_coordinates(dt_boxes.tolist()) if len(dt_boxes) else []
                 sig_src = (current_frame_no, dt_boxes, coordinate_list)
                 dbg(f'[FRAME] f={current_frame_no} DET frac={None if frac is None else round(frac, 5)} '
                     f'boxes={len(dt_boxes)}')
                 if len(dt_boxes):
-                    dt_box, rec_res = self._ocr_in_area(frame, dt_boxes, coordinate_list)
+                    dt_box, rec_res = self._ocr_in_area(frame, dt_boxes, coordinate_list, origin)
                     entry = {'text': "".join(self.__get_area_text((dt_box, rec_res))),
                              'dt_box': dt_box, 'rec_res': rec_res}
             sig_prev = sig
@@ -400,7 +398,8 @@ class SubtitleExtractor:
                 if is_finding_end_frame_no:
                     # 判断该帧与头帧ocr内容是否一致,若不一致则找到尾，尾巴为前一帧
                     if not self._compare_ocr_result(compare_ocr_result_cache, None, start_frame_no, frame, current_frame_no,
-                                                    img2_polys=dt_boxes, img2_coordinates=coordinate_list):
+                                                    img2_polys=dt_boxes, img2_coordinates=coordinate_list,
+                                                    img2_origin=origin):
                         is_finding_end_frame_no = False
                         is_finding_start_frame_no = True
                         end_frame_no = current_frame_no - 1
@@ -1023,6 +1022,137 @@ class SubtitleExtractor:
     SIGNATURE_DIFF_GRAY = 16
     SIGNATURE_MAX_FRAC = float(os.environ.get('VSE_SIG_MAX_FRAC', '0.003'))
 
+    # ---- 管道解码参数 ----
+    # 精确模式只需要字幕条上的像素，整帧 4K 每帧 24MB 的 YUV→BGR 转换和 Mat 拷贝是纯浪费。
+    # 改成 ffmpeg 顺序解码 + crop 到字幕条后走管道，实测 4K 每帧 15.2ms → 5.5ms（软解）、
+    # 4.6ms（NVDEC，且 CPU 占用降到约 1/4，给 det/rec 让出核心）。
+    # VSE_PIPE_DECODE=0 可退回原来的 cv2 整帧读取；VSE_DECODE_HWACCEL=0 只关 GPU 解码。
+    PIPE_DECODE = os.environ.get('VSE_PIPE_DECODE', '1') == '1'
+    DECODE_HWACCEL = os.environ.get('VSE_DECODE_HWACCEL', '0') == '1'
+    # YUV→RGB 色彩矩阵：OpenCV 的 sws 上下文不读流标签，固定按 BT.601 转换；
+    # ffmpeg CLI 默认按流标签（本片源标 bt709），两者通道值差 B+4.6 / R-5.5，
+    # 会让 det 在淡入淡出帧上给不同结果。显式指定 bt601 后逐像素完全一致。
+    DECODE_COLOR = os.environ.get('VSE_DECODE_COLOR', 'bt601')
+
+    def _strip_box(self, frame_shape):
+        """
+        字幕条解码范围（整帧坐标），与 _signature_region / _detect_subtitle_in_area 的留白一致。
+        返回 (x0, y0, x1, y1)。
+        """
+        h, w = frame_shape[:2]
+        sub_area = self.sub_area
+        if sub_area is None:
+            return (0, 0, w, h)
+        pad = 16
+        x0 = max(0, int(sub_area.xmin) - pad)
+        x1 = min(w, int(sub_area.xmax) + pad)
+        y0 = max(0, int(sub_area.ymin) - pad)
+        y1 = min(h, int(sub_area.ymax) + pad)
+        if x1 <= x0 or y1 <= y0:
+            return (0, 0, w, h)
+        return (x0, y0, x1, y1)
+
+    @staticmethod
+    def _iter_cap_frames(video_cap):
+        """cv2 整帧顺序读（管道解码不可用时的回退路径），产出 (frame_no, frame, origin)"""
+        frame_no = 0
+        while video_cap.isOpened():
+            ret, frame = video_cap.read()
+            if not ret:
+                break
+            frame_no += 1
+            yield frame_no, frame, (0, 0)
+
+    def _spawn_strip_decoder(self, x, y, w, h, use_hwaccel):
+        """启动一个只输出字幕条 rawvideo 的 ffmpeg 进程；失败返回 None"""
+        ffmpeg = None
+        try:
+            import imageio_ffmpeg
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            ffmpeg = shutil.which('ffmpeg')
+        if not ffmpeg or not os.path.exists(ffmpeg):
+            ffmpeg = shutil.which('ffmpeg')
+        if not ffmpeg:
+            return None
+        cmd = [ffmpeg, '-hide_banner', '-nostats', '-loglevel', 'error']
+        if use_hwaccel:
+            cmd += ['-hwaccel', 'cuda']
+        cmd += ['-i', self.video_path,
+                '-vf', f'crop={w}:{h}:{x}:{y},scale=in_color_matrix={self.DECODE_COLOR}:in_range=auto',
+                # 必须 1:1 输出：默认的 cfr 模式会复制帧补齐时间戳，
+                # 实测 4K HEVC 会多出 7 帧（开头 3 帧），导致整条时间轴偏移
+                '-fps_mode', 'passthrough',
+                '-an', '-pix_fmt', 'bgr24', '-f', 'rawvideo', '-']
+        try:
+            return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    bufsize=w * h * 3)
+        except Exception as e:
+            print(f'[decode] ffmpeg 启动失败: {e}', flush=True)
+            return None
+
+    def _iter_strip_frames(self):
+        """
+        顺序解码视频，只输出字幕条区域。产出 (frame_no, strip, (x0, y0))：
+        strip 是字幕条局部图像，origin 是它在整帧中的左上角（下游坐标仍用整帧坐标系）。
+        优先尝试 NVDEC，失败自动回退软解；两者都不可用时回退 cv2 整帧读取。
+        """
+        h, w = self.frame_height, self.frame_width
+        bx0, by0, bx1, by1 = self._strip_box((h, w))
+        # yuv420 的 crop 要求 x/y/w/h 为偶数：先向外扩到偶数，Python 侧再裁回精确范围
+        dx0, dy0 = bx0 - (bx0 & 1), by0 - (by0 & 1)
+        dx1, dy1 = min(w, bx1 + (bx1 & 1)), min(h, by1 + (by1 & 1))
+        cw, ch = dx1 - dx0, dy1 - dy0
+        if cw <= 0 or ch <= 0:
+            yield from self._iter_cap_frames(self.video_cap)
+            return
+        frame_bytes = cw * ch * 3
+        # 精确裁回目标范围的切片（偶数对齐可能多出 1px）
+        sx0, sy0, sx1, sy1 = bx0 - dx0, by0 - dy0, bx1 - dx0, by1 - dy0
+        modes = [True, False] if self.DECODE_HWACCEL else [False]
+        for use_hwaccel in modes:
+            proc = self._spawn_strip_decoder(dx0, dy0, cw, ch, use_hwaccel)
+            if proc is None:
+                continue
+            frame_no = 0
+            try:
+                while True:
+                    buf = proc.stdout.read(frame_bytes)
+                    if not buf or len(buf) < frame_bytes:
+                        break
+                    strip = np.frombuffer(buf, np.uint8).reshape(ch, cw, 3)
+                    frame_no += 1
+                    yield frame_no, strip[sy0:sy1, sx0:sx1], (bx0, by0)
+            finally:
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+            if frame_no > 0:
+                if abs(frame_no - int(self.frame_count)) > 1:
+                    # 管道提前结束（解码错误等）：帧号会与视频总帧数错位，明确告警而不是静默截断
+                    print(f'[decode] 警告：管道输出 {frame_no} 帧，与视频总帧数 '
+                          f'{int(self.frame_count)} 不符，时间轴可能偏移', flush=True)
+                return
+            # 这个模式一帧都没读出来（例如无 NVIDIA 驱动）→ 试下一个模式
+        # 全部失败 → 回退整帧读取，保证功能不受影响
+        yield from self._iter_cap_frames(self.video_cap)
+
+    def _iter_frames(self):
+        """统一取帧入口：管道解码（字幕条）或 cv2 整帧，产出 (frame_no, frame, origin)"""
+        if self.PIPE_DECODE and self.sub_area is not None:
+            yield from self._iter_strip_frames()
+        else:
+            yield from self._iter_cap_frames(self.video_cap)
+
     def _signature_region(self, frame_shape):
         """
         签名采样区域：与 _detect_subtitle_in_area 的裁剪范围一致（sub_area 外扩 16px），
@@ -1042,28 +1172,38 @@ class SubtitleExtractor:
         return (y0, y1, x0, x1, 8)
 
     @staticmethod
-    def _strip_signature(frame, region):
+    def _strip_signature(frame, region, origin=(0, 0)):
         """
         字幕条签名：单通道、步长采样的小矩阵（4K 字幕条约 57x432，拷贝开销 ~0.05ms）。
         视频解码对相同内容块输出相同像素，直接数值比较即可。
+        :param origin: frame 左上角在整帧坐标系中的位置，region 是整帧坐标下的采样区域
         """
         y0, y1, x0, x1, step = region
-        return np.ascontiguousarray(frame[y0:y1:step, x0:x1:step, 0])
+        ox, oy = origin
+        ry0, ry1 = max(0, y0 - oy), min(frame.shape[0], y1 - oy)
+        rx0, rx1 = max(0, x0 - ox), min(frame.shape[1], x1 - ox)
+        if ry1 <= ry0 or rx1 <= rx0:
+            return None
+        return np.ascontiguousarray(frame[ry0:ry1:step, rx0:rx1:step, 0])
 
-    def _detect_subtitle_in_area(self, frame):
+    def _detect_subtitle_in_area(self, frame, origin=(0, 0)):
         """
         只在字幕选区（外加少量留白）上跑文本检测，并把坐标换算回整帧坐标系。
         整帧检测实测 ~33ms，裁到字幕条后 ~16ms，且选区外的文字本来也不参与判定。
+        :param origin: frame 左上角在整帧坐标系中的位置；传字幕条时用它换算裁剪范围，
+                       只要字幕条覆盖了选区留白范围，检测输入与整帧路径完全一致
         """
         sub_area = self.sub_area
         if sub_area is None:
             return self.sub_detector.detect_subtitle(frame)
         h, w = frame.shape[:2]
+        ox, oy = origin
         pad = 16
-        x0 = max(0, int(sub_area.xmin) - pad)
-        x1 = min(w, int(sub_area.xmax) + pad)
-        y0 = max(0, int(sub_area.ymin) - pad)
-        y1 = min(h, int(sub_area.ymax) + pad)
+        # 整帧坐标下的目标范围 → 换算到 frame 局部坐标
+        x0 = max(0, int(sub_area.xmin) - pad - ox)
+        x1 = min(w, int(sub_area.xmax) + pad - ox)
+        y0 = max(0, int(sub_area.ymin) - pad - oy)
+        y1 = min(h, int(sub_area.ymax) + pad - oy)
         if x1 <= x0 or y1 <= y0:
             return self.sub_detector.detect_subtitle(frame)
         crop = frame[y0:y1, x0:x1]
@@ -1074,8 +1214,8 @@ class SubtitleExtractor:
             return dt_boxes, elapse
         # 坐标从裁剪图坐标系平移回整帧坐标系
         dt_boxes = dt_boxes.copy()
-        dt_boxes[:, :, 0] += x0
-        dt_boxes[:, :, 1] += y0
+        dt_boxes[:, :, 0] += x0 + ox
+        dt_boxes[:, :, 1] += y0 + oy
         # 合并高度重叠的框：det 偶尔把一行字幕拆成两个重叠框，不合并会拼出重复文本
         dt_boxes = self._dedup_polys(dt_boxes)
         return dt_boxes, elapse
@@ -1119,10 +1259,11 @@ class SubtitleExtractor:
             merged.append([[ax0, ay0], [ax1, ay0], [ax1, ay1], [ax0, ay1]])
         return np.asarray(merged, dtype=dt_boxes.dtype)
 
-    def _ocr_in_area(self, frame, dt_boxes, coordinate_list):
+    def _ocr_in_area(self, frame, dt_boxes, coordinate_list, origin=(0, 0)):
         """
         复用本帧已算出的检测框，只对完全落在字幕选区内的框做识别（跳过重复的 det）。
         返参格式与 OcrRecogniser.predict() 一致。
+        :param origin: frame 左上角在整帧坐标系中的位置；dt_boxes/coordinate_list 始终是整帧坐标
         """
         if dt_boxes is None or len(dt_boxes) == 0:
             return [], []
@@ -1135,10 +1276,10 @@ class SubtitleExtractor:
                          and sub_area.ymin <= c[2] and c[3] <= sub_area.ymax)]
         if not polys:
             return [], []
-        return self.ocr.recognise_polys(frame, polys)
+        return self.ocr.recognise_polys(frame, polys, origin=origin)
 
     def _compare_ocr_result(self, result_cache, img1, img1_no, img2, img2_no,
-                            img2_polys=None, img2_coordinates=None):
+                            img2_polys=None, img2_coordinates=None, img2_origin=(0, 0)):
         """
         比较两张图片预测出的字幕区域文本是否相同
         img2_polys / img2_coordinates 可传入该帧已算出的检测结果，避免重复检测
@@ -1157,7 +1298,7 @@ class SubtitleExtractor:
             area_text2 = result_cache[img2_no]['text']
         else:
             if img2_polys is not None and img2_coordinates is not None:
-                dt_box, rec_res = self._ocr_in_area(img2, img2_polys, img2_coordinates)
+                dt_box, rec_res = self._ocr_in_area(img2, img2_polys, img2_coordinates, origin=img2_origin)
             else:
                 dt_box, rec_res = self.ocr.predict(img2)
             area_text2 = "".join(self.__get_area_text((dt_box, rec_res)))

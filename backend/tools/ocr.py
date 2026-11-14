@@ -110,12 +110,15 @@ class OcrRecogniser:
         return self._rec_model
 
     @staticmethod
-    def _extract_crops(image, polys, pad_ratio=0.10):
+    def _extract_crops(image, polys, pad_ratio=0.10, origin=(0, 0)):
         """
         按检测框裁图（向外扩展留识别边界余量），返回 (crops, keep_polys)。
         过小（<4px）或裁空的框会被丢弃。
+        :param origin: image 左上角在整帧坐标系中的位置 (ox, oy)。polys 始终使用整帧坐标，
+                       传入字幕条等局部图像时用它换算裁剪位置（origin=(0,0) 即整帧，行为不变）
         """
         h_img, w_img = image.shape[:2]
+        ox, oy = origin
         crops = []
         keep = []
         for poly in polys:
@@ -127,10 +130,10 @@ class OcrRecogniser:
                 continue
             pad_y = max(2, int((ymax - ymin) * pad_ratio))
             pad_x = max(2, int(pad_y * 0.5))
-            x0 = max(0, xmin - pad_x)
-            x1 = min(w_img, xmax + pad_x)
-            y0 = max(0, ymin - pad_y)
-            y1 = min(h_img, ymax + pad_y)
+            x0 = max(0, xmin - pad_x - ox)
+            x1 = min(w_img, xmax + pad_x - ox)
+            y0 = max(0, ymin - pad_y - oy)
+            y1 = min(h_img, ymax + pad_y - oy)
             crop = image[y0:y1, x0:x1]
             if crop.size == 0:
                 continue
@@ -138,12 +141,13 @@ class OcrRecogniser:
             keep.append(poly)
         return crops, keep
 
-    def recognise_polys(self, image, polys, pad_ratio=0.10):
+    def recognise_polys(self, image, polys, pad_ratio=0.10, origin=(0, 0)):
         """
         复用已有检测框，只做识别（跳过 det）。
         :param image: 整帧图像（与 polys 同一坐标系）
         :param polys: 检测框序列，每个元素为 4 点多边形（numpy / list 均可）
         :param pad_ratio: 裁图时按框高的多少比例向外扩展，给识别模型留边界余量
+        :param origin: image 左上角在整帧坐标系中的位置；传字幕条等局部图像时使用
         :return: (dt_box, rec_res)，格式与 predict() 完全一致
         """
         if not self.recogniser:
@@ -154,7 +158,7 @@ class OcrRecogniser:
             # 拿不到识别子模型时退回完整流程，保证结果正确性
             return self.predict(image)
 
-        crops, keep = self._extract_crops(image, polys, pad_ratio)
+        crops, keep = self._extract_crops(image, polys, pad_ratio, origin)
         if not crops:
             return [], []
 
