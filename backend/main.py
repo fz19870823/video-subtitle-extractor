@@ -720,13 +720,22 @@ class SubtitleExtractor:
             with open(self.subtitle_output_path, mode='w', encoding='utf-8') as f:
                 for index, content in enumerate(subtitle_content):
                     line_code = index + 1
-                    frame_start = self._frame_to_timecode(int(content[0]))
+                    start_frame = int(content[0])
+                    origin_end_frame = int(content[1])
+                    frame_start = self._frame_to_timecode(start_frame)
                     # 比较起始帧号与结束帧号， 如果字幕持续时间不足1秒，则将显示时间设为1s
-                    if abs(int(content[1]) - int(content[0])) < self.fps:
-                        frame_end = self._frame_to_timecode(int(int(content[0]) + self.fps))
+                    if abs(origin_end_frame - start_frame) < self.fps:
+                        end_frame = start_frame + self.fps
+                        # 补足到 1s 后不能越过下一条字幕的起始帧，否则两条字幕在时间轴上重叠
+                        if index + 1 < len(subtitle_content):
+                            next_start_frame = int(subtitle_content[index + 1][0])
+                            end_frame = min(end_frame, next_start_frame - 1)
+                        # 与下一条几乎紧邻时可能补不出时长，此时保留原始结束帧（重叠源于原始数据本身）
+                        end_frame = max(end_frame, origin_end_frame)
+                        frame_end = self._frame_to_timecode(end_frame)
                         post_process_subtitle.append(line_code)
                     else:
-                        frame_end = self._frame_to_timecode(int(content[1]))
+                        frame_end = self._frame_to_timecode(origin_end_frame)
                     frame_content = content[2]
                     subtitle_line = f'{line_code}\n{frame_start} --> {frame_end}\n{frame_content}\n'
                     f.write(subtitle_line)
