@@ -1,5 +1,6 @@
 import os
 import re
+import traceback
 from multiprocessing import Queue, Process
 import cv2
 from PIL import ImageFont, ImageDraw, Image
@@ -135,9 +136,10 @@ def ocr_task_consumer(ocr_queue, raw_subtitle_path, sub_area, video_path, option
     :param options
     """
     data = {'i': 1}
-    # 初始化文本识别对象
-    text_recogniser = OcrRecogniser()
-    text_recogniser.hardware_accelerator = options.HARDWARD_ACCELERATOR
+    # 文本识别对象延迟创建：精确模式下上游已给出 dt_box/rec_res，这里只是整理文本，
+    # 不需要模型。提前创建会让子进程/线程白白加载一套 paddle（打包版同进程运行时会
+    # 和主进程的 predictor 抢 CUDA，实测直接死锁），也让启动快很多。
+    text_recogniser = None
     # 丢失字幕的存储路径
     ocr_loss_debug_path = os.path.join(os.path.abspath(os.path.splitext(video_path)[0]), 'loss')
     # 删除之前的缓存垃圾
@@ -156,12 +158,19 @@ def ocr_task_consumer(ocr_queue, raw_subtitle_path, sub_area, video_path, option
                     progress_queue.put((-1, total_tasks))
                     return
                 data['i'] = frame_no
+                # 只有上游没给识别结果时才需要模型（懒加载，见上面的说明）
+                if (dt_box is None or rec_res is None) and text_recogniser is None:
+                    text_recogniser = OcrRecogniser()
+                    text_recogniser.hardware_accelerator = options.HARDWARD_ACCELERATOR
                 extract_subtitles(data, text_recogniser, frame, raw_subtitles, sub_area, options, dt_box,
                                     rec_res, ocr_loss_debug_path)
                 processed_count += 1
                 progress_queue.put((frame_no, processed_count))
             except Exception as e:
-                print(e)
+                # 这里不能只 print(e)：打包版 stdout 是 GBK 时 print 自身就会抛
+                # UnicodeEncodeError，把整个消费线程打死而生产者继续入队 →
+                # 队列撑满，主进程 join 永久阻塞。打完整栈便于定位。
+                traceback.print_exc()
                 progress_queue.put(-1)
                 break
     finally:
@@ -182,6 +191,16 @@ def ocr_task_producer(ocr_queue, task_queue, progress_queue, video_path, raw_sub
     cap = cv2.VideoCapture(video_path)
     tbar = None
     frame_count = 0
+
+    def _put(item):
+        """带超时入队：消费者若已退出，这里不能永久阻塞（否则主进程 join 挂死）"""
+        try:
+            ocr_queue.put(item, timeout=60)
+            return True
+        except queue.Full:
+            print('[subtitle_ocr] 消费线程疑似已退出，停止入队', flush=True)
+            return False
+
     while True:
         try:
             # 从任务队列中提取任务信息
@@ -191,9 +210,9 @@ def ocr_task_producer(ocr_queue, task_queue, progress_queue, video_path, raw_sub
             # current_frame 等于-1说明所有视频帧已经读完
             if current_frame_no == -1:
                 # ocr识别队列加入结束标志，附带总帧数
-                ocr_queue.put((-1, frame_count, None, None))
-                # 通过 progress_queue 提前通知总帧数，让主进程可以精确计算进度
-                progress_queue.put((-2, frame_count))
+                if _put((-1, frame_count, None, None)):
+                    # 通过 progress_queue 提前通知总帧数，让主进程可以精确计算进度
+                    progress_queue.put((-2, frame_count))
                 # 更新进度条
                 tbar.update(tbar.total - tbar.n)
                 break
@@ -201,7 +220,8 @@ def ocr_task_producer(ocr_queue, task_queue, progress_queue, video_path, raw_sub
             # 如果上游（精确模式）已经给了检测框和识别结果，这一帧就不需要再解码：
             # 4K 片源随机 seek 一次约 450ms，而这里只是写文件，没必要重复提取。
             if dt_box is not None and rec_res is not None:
-                ocr_queue.put((current_frame_no, None, dt_box, rec_res))
+                if not _put((current_frame_no, None, dt_box, rec_res)):
+                    break
                 continue
             # 设置当前视频帧
             # 如果total_ms不为空，则使用了VSF提取字幕
@@ -218,9 +238,10 @@ def ocr_task_producer(ocr_queue, task_queue, progress_queue, video_path, raw_sub
                 if default_subtitle_area is not None:
                     frame = frame_preprocess(default_subtitle_area, frame)
                 # print(f"current_frame_no: {current_frame_no}")
-                ocr_queue.put((current_frame_no, frame, dt_box, rec_res))
+                if not _put((current_frame_no, frame, dt_box, rec_res)):
+                    break
         except Exception as e:
-            print(e)
+            traceback.print_exc()
             break
     cap.release()
 

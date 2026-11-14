@@ -155,8 +155,10 @@ class SubtitleExtractor:
         # 往字幕OCR任务队列中，添加OCR识别任务结束标志
         # 任务格式为：(total_frame_count总帧数, current_frame_no当前帧, dt_box检测框, rec_res识别结果, 当前帧时间， subtitle_area字幕区域)
         self.subtitle_ocr_task_queue.put((self.frame_count, -1, None, None, None, None))
-        # 等待子线程完成
-        subtitle_ocr_process.join()
+        # 等待子线程完成（带超时：OCR 线程若异常退出，无超时会永久挂住主进程）
+        subtitle_ocr_process.join(timeout=1800)
+        if subtitle_ocr_process.is_alive():
+            raise RuntimeError('OCR 识别进程 30 分钟内未结束，请检查 loss 日志或重试')
         # 打印完成提示
         self.append_output(tr['Main']['FinishProcessFrame'])
         self.append_output(tr['Main']['FinishFindSub'])
