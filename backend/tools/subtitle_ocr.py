@@ -7,6 +7,7 @@ from PIL import ImageFont, ImageDraw, Image
 from tqdm import tqdm
 from backend.tools.ocr import OcrRecogniser, get_coordinates
 from backend.tools.constant import SubtitleArea
+from backend.bean.subtitle_area import SubtitleArea as SubtitleAreaRect
 from backend.tools import constant
 from threading import Thread
 import queue
@@ -18,17 +19,23 @@ from backend.config import tr
 
 
 def extract_subtitles(data, text_recogniser, img, raw_subtitles,
-                      sub_area, options, dt_box_arg, rec_res_arg, ocr_loss_debug_path):
+                      sub_area, options, dt_box_arg, rec_res_arg, ocr_loss_debug_path,
+                      sub_area_local=None):
     """
     提取视频帧中的字幕信息
     """
     # 从参数中获取检测框与检测结果
     dt_box = dt_box_arg
     rec_res = rec_res_arg
+    # 上游（精确模式）给出结果时，框是整帧坐标，越界判定用整帧选区；
+    # 没给则下面在裁剪图上自己检测，坐标是局部坐标，要用平移后的选区，否则整片都会被判越界。
     # 如果没有检测结果，则获取检测结果
     if dt_box is None or rec_res is None:
         dt_box, rec_res = text_recogniser.predict(img)
-        # rec_res格式为： ("hello", 0.997)
+        check_area = sub_area_local if sub_area_local is not None else sub_area
+    else:
+        check_area = sub_area
+    # rec_res格式为： ("hello", 0.997)
     # 获取文本坐标
     coordinates = get_coordinates(dt_box)
     # 将结果写入txt文本中
@@ -42,23 +49,23 @@ def extract_subtitles(data, text_recogniser, img, raw_subtitles,
     for content, coordinate in zip(text_res, coordinates):
         text = content[0]
         prob = content[1]
-        if sub_area is not None:
+        if check_area is not None:
             selected = False
             # 初始化超界偏差为0
             overflow_area_rate = 0
             # 使用AABB矩形重叠判断（比Shapely Polygon快得多）
             c_xmin, c_xmax, c_ymin, c_ymax = coordinate
             # 计算交集矩形
-            inter_xmin = max(sub_area.xmin, c_xmin)
-            inter_ymin = max(sub_area.ymin, c_ymin)
-            inter_xmax = min(sub_area.xmax, c_xmax)
-            inter_ymax = min(sub_area.ymax, c_ymax)
+            inter_xmin = max(check_area.xmin, c_xmin)
+            inter_ymin = max(check_area.ymin, c_ymin)
+            inter_xmax = min(check_area.xmax, c_xmax)
+            inter_ymax = min(check_area.ymax, c_ymax)
             has_intersection = inter_xmin < inter_xmax and inter_ymin < inter_ymax
             drop_reason = ''
             # 如果有交集
             if has_intersection:
-                sub_area_w = sub_area.xmax - sub_area.xmin
-                sub_area_h = sub_area.ymax - sub_area.ymin
+                sub_area_w = check_area.xmax - check_area.xmin
+                sub_area_h = check_area.ymax - check_area.ymin
                 sub_area_size = sub_area_w * sub_area_h
                 inter_area = (inter_xmax - inter_xmin) * (inter_ymax - inter_ymin)
                 coord_area = (c_xmax - c_xmin) * (c_ymax - c_ymin)
@@ -126,7 +133,8 @@ def paint_chinese_opencv(im, chinese, pos, color):
     return img
 
 
-def ocr_task_consumer(ocr_queue, raw_subtitle_path, sub_area, video_path, options, progress_queue):
+def ocr_task_consumer(ocr_queue, raw_subtitle_path, sub_area, video_path, options, progress_queue,
+                       sub_area_local=None):
     """
     消费者： 消费ocr_queue，将ocr队列中的数据取出，进行ocr识别，写入字幕文件中
     :param ocr_queue (current_frame_no当前帧帧号, frame 视频帧, dt_box检测框, rec_res识别结果)
@@ -163,7 +171,7 @@ def ocr_task_consumer(ocr_queue, raw_subtitle_path, sub_area, video_path, option
                     text_recogniser = OcrRecogniser()
                     text_recogniser.hardware_accelerator = options.HARDWARD_ACCELERATOR
                 extract_subtitles(data, text_recogniser, frame, raw_subtitles, sub_area, options, dt_box,
-                                    rec_res, ocr_loss_debug_path)
+                                    rec_res, ocr_loss_debug_path, sub_area_local)
                 processed_count += 1
                 progress_queue.put((frame_no, processed_count))
             except Exception as e:
@@ -179,7 +187,8 @@ def ocr_task_consumer(ocr_queue, raw_subtitle_path, sub_area, video_path, option
                 raw_subtitle_file.write(line)
 
 
-def ocr_task_producer(ocr_queue, task_queue, progress_queue, video_path, raw_subtitle_path):
+def ocr_task_producer(ocr_queue, task_queue, progress_queue, video_path, raw_subtitle_path,
+                      crop_rect=None):
     """
     生产者：负责生产用于OCR识别的数据，将需要进行ocr识别的数据加入ocr_queue中
     :param ocr_queue (current_frame_no当前帧帧号, frame 视频帧, dt_box检测框, rec_res识别结果)
@@ -234,8 +243,13 @@ def ocr_task_producer(ocr_queue, task_queue, progress_queue, video_path, raw_sub
             # 如果读取成功
             if ret:
                 frame_count += 1
-                # 根据默认字幕位置，则对视频帧进行裁剪，裁剪后处理
-                if default_subtitle_area is not None:
+                # 优先按用户选区裁剪：det 只看到字幕条，不会把选区外的招牌/台标
+                # 也检出来再丢掉（快速模式下这类无谓识别曾占全部识别结果的 59%）。
+                # 没有选区时才退回按上/下半帧的粗略裁剪。
+                if crop_rect is not None:
+                    x0, y0, x1, y1 = crop_rect
+                    frame = frame[y0:y1, x0:x1]
+                elif default_subtitle_area is not None:
                     frame = frame_preprocess(default_subtitle_area, frame)
                 # print(f"current_frame_no: {current_frame_no}")
                 if not _put((current_frame_no, frame, dt_box, rec_res)):
@@ -259,15 +273,40 @@ def subtitle_extract_handler(task_queue, progress_queue, video_path, raw_subtitl
     # 删除缓存
     if os.path.exists(raw_subtitle_path):
         os.remove(raw_subtitle_path)
+
+    # 计算裁剪矩形与"平移后的选区"，供自识别回退路径使用。
+    # 子进程原先只按 SubtitleArea 预设裁上/下半帧，det 会把半个 4K 画面上的招牌、
+    # 台标全检出来，再逐条按"超出选区"丢掉——纯浪费算力，日志也全是这类丢弃。
+    # 现在统一裁到「选区 + 16px」，坐标系一起平移到裁剪图里。
+    crop_rect = None
+    sub_area_local = None
+    try:
+        cap_probe = cv2.VideoCapture(video_path)
+        if cap_probe.isOpened():
+            probe_w = int(cap_probe.get(cv2.CAP_PROP_FRAME_WIDTH))
+            probe_h = int(cap_probe.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            crop_rect = area_crop_rect(sub_area, probe_w, probe_h)
+        cap_probe.release()
+        if crop_rect is not None:
+            ox, oy = crop_rect[0], crop_rect[1]
+            sub_area_local = SubtitleAreaRect(sub_area.ymin - oy, sub_area.ymax - oy,
+                                              sub_area.xmin - ox, sub_area.xmax - ox)
+    except Exception:
+        # 裁剪只是省算力的优化，失败就退回原有整帧/半帧路径，不能影响提取
+        traceback.print_exc()
+        crop_rect, sub_area_local = None, None
+
     # 创建一个OCR队列，大小建议值8-20
     ocr_queue = queue.Queue(20)
     # 创建一个OCR事件生产者线程
     ocr_event_producer_thread = Thread(target=ocr_task_producer,
-                                       args=(ocr_queue, task_queue, progress_queue, video_path, raw_subtitle_path,),
+                                       args=(ocr_queue, task_queue, progress_queue, video_path, raw_subtitle_path,
+                                             crop_rect),
                                        daemon=True)
     # 创建一个OCR事件消费者提取线程
     ocr_event_consumer_thread = Thread(target=ocr_task_consumer,
-                                       args=(ocr_queue, raw_subtitle_path, sub_area, video_path, options, progress_queue,),
+                                       args=(ocr_queue, raw_subtitle_path, sub_area, video_path, options,
+                                             progress_queue, sub_area_local),
                                        daemon=True)
     # 开启消费者线程
     ocr_event_producer_thread.start()
@@ -303,6 +342,27 @@ def async_start(video_path, raw_subtitle_path, sub_area, options):
     # 启动进程
     p.start()
     return p, task_queue, progress_queue
+
+
+# 与主进程 _detect_subtitle_in_area / _iter_strip_frames 保持一致的外扩像素：
+# 留白是为了不把贴着选区边界的字幕笔画切掉，det 需要看到完整字形才能识别正确。
+AREA_PAD = 16
+
+
+def area_crop_rect(sub_area, frame_w, frame_h, pad=AREA_PAD):
+    """
+    选区 → 裁剪矩形 (x0, y0, x1, y1)，外扩 pad 并夹到画面内。
+    sub_area 为 None（未指定选区）时返回 None，调用方退回原有整帧/半帧逻辑。
+    """
+    if sub_area is None or frame_w <= 0 or frame_h <= 0:
+        return None
+    x0 = max(0, int(sub_area.xmin) - pad)
+    y0 = max(0, int(sub_area.ymin) - pad)
+    x1 = min(int(frame_w), int(sub_area.xmax) + pad)
+    y1 = min(int(frame_h), int(sub_area.ymax) + pad)
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return None
+    return x0, y0, x1, y1
 
 
 def frame_preprocess(subtitle_area, frame):
