@@ -16,8 +16,16 @@ PY=".venv/Scripts/python.exe"
 [ -x "$PY" ] || PY=".venv/Scripts/python.exe"
 
 echo "==> 清理暂存目录"
-rm -rf tmp/_stage tmp/_release_old
+# safe-delete 钩子会拦截"一次删掉上万个文件"（构建产物 5G / 6000+ 文件），
+# 这里必须是 best-effort：删不掉也不能影响后面的构建。
+rm -rf tmp/_stage 2>/dev/null || true
 mkdir -p tmp
+# 上一次换下来的旧产物叫 tmp/_release_old，钩子删不掉它就一直在。
+# 改成带时间戳的名字（只是改名，不删文件），免得挡住本次 mv；
+# 磁盘空间需要手动清理，脚本末尾会提示。
+if [ -d tmp/_release_old ]; then
+    mv tmp/_release_old "tmp/_release_old_$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+fi
 
 # config/config.json 是个机配置文件（已 gitignore），打包时会被塞进 _internal 作为
 # 新装用户的默认配置。开发时跑 CLI 会把 --lang / --force-lang 写进去，如果不还原，
