@@ -30,8 +30,9 @@ def build_parser():
                    help='字幕区域 y0,y1,x0,x1（像素），不填则半自动检测')
     p.add_argument('--output', default=None,
                    help='输出 srt 路径，默认与视频同目录同名')
-    p.add_argument('--mode', default='accurate', choices=['accurate', 'fast'],
-                   help='提取模式，默认 accurate（精确）')
+    p.add_argument('--mode', default='accurate', choices=['auto', 'accurate', 'fast'],
+                   help='提取模式，默认 accurate（精准）。auto 在有 GPU 时等同 accurate，'
+                        '无 GPU 时退回 fast')
     p.add_argument('--lang', default='ch', help='字幕语言，默认 ch')
     p.add_argument('--no-hwaccel', action='store_true', help='禁用硬件加速')
     p.add_argument('--debug-state', action='store_true',
@@ -106,18 +107,21 @@ def main(argv=None):
     if single_process_ocr_enabled():
         apply_single_process_ocr()
 
-    config.set(config.mode, args.mode)
-    config.set(config.debugNoDeleteCache, False)
-    config.set(config.wordSegmentation, False)
-    try:
-        config.set(config.language, args.lang)
-    except Exception:
-        pass
-    if args.no_hwaccel:
+    # config.set 会触发 qconfig.save 写 config/config.json。文件被占用/只读时
+    # 会抛 PermissionError（实测踩过一次：config.json 被锁，CLI 直接崩在启动阶段，
+    # 界面里完全看不出原因），这里降级为警告并继续用内存里的值。
+    def _set(item, value):
         try:
-            config.set(config.hardwareAcceleration, False)
-        except Exception:
-            pass
+            config.set(item, value)
+        except Exception as e:
+            print(f'[WARN] 写配置文件失败（继续使用内存值）: {e}', file=sys.stderr)
+
+    _set(config.mode, args.mode)
+    _set(config.debugNoDeleteCache, False)
+    _set(config.wordSegmentation, False)
+    _set(config.language, args.lang)
+    if args.no_hwaccel:
+        _set(config.hardwareAcceleration, False)
 
     area = None
     if args.area:

@@ -142,8 +142,13 @@ class SubtitleExtractor:
         subtitle_ocr_process = self.start_subtitle_ocr_async()
         if self.sub_area is not None:
             if platform.system() in ['Windows', 'Linux', 'Darwin']:
-                # 使用GPU且使用accurate模式时才开放此方法：
-                if self.hardware_accelerator.has_accelerator() and config.mode.value == 'accurate':
+                # 有 GPU 时"精准"和"自动"都走 det（GPU 检测）：在这类机器上 det 比
+                # VideoSubFinder 又快又准，而 VSF 会把 CPU 核心吃满、GPU 全程闲置。
+                # 4K 2 分钟样片实测：det 71.9s / 30 条 / CPU 1~2 核 / GPU 忙；
+                #                    VSF 124.1s / 19 条 / VSF 单进程吃 8~10.5 核 / GPU 1~4%。
+                # 无 GPU 时 auto 仍退回 VSF —— CPU 上逐帧 det 太慢（约 13s/帧）。
+                # 显式选"快速"的仍然走 VSF，保留原来的行为。
+                if self.hardware_accelerator.has_accelerator() and config.mode.value in ('accurate', 'auto'):
                     self.extract_frame_by_det()
                 else:
                     self.extract_frame_by_vsf()
