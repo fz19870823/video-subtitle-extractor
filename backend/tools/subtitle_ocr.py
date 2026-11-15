@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import traceback
 from multiprocessing import Queue, Process
 import cv2
@@ -148,6 +149,10 @@ def ocr_task_consumer(ocr_queue, raw_subtitle_path, sub_area, video_path, option
     # 不需要模型。提前创建会让子进程/线程白白加载一套 paddle（打包版同进程运行时会
     # 和主进程的 predictor 抢 CUDA，实测直接死锁），也让启动快很多。
     text_recogniser = None
+    # 一次识别的帧数。攒批是"帧级"批量：把 N 张同尺寸的字幕条一次性送进 det+rec，
+    # 减少 Python 侧调用与显存同步次数。N 取自配置 MaxBatchSize。
+    batch_size = int(getattr(options, 'MAX_BATCH_SIZE', 1) or 1)
+    batch_size = max(1, min(batch_size, 32))
     # 丢失字幕的存储路径
     ocr_loss_debug_path = os.path.join(os.path.abspath(os.path.splitext(video_path)[0]), 'loss')
     # 删除之前的缓存垃圾
@@ -156,24 +161,59 @@ def ocr_task_consumer(ocr_queue, raw_subtitle_path, sub_area, video_path, option
 
     raw_subtitles = []
     processed_count = 0
+
+    def process_items(items):
+        """处理一批帧：需要识别的合并成一次 predict，再把结果按原顺序写回。"""
+        nonlocal text_recogniser, processed_count
+        need_idx = [i for i, it in enumerate(items) if it[2] is None or it[3] is None]
+        result_by_idx = {}
+        if need_idx:
+            if text_recogniser is None:
+                text_recogniser = OcrRecogniser(batch_size=batch_size)
+                text_recogniser.hardware_accelerator = options.HARDWARD_ACCELERATOR
+            frames = [items[i][1] for i in need_idx]
+            results = text_recogniser.predict_batch(frames)
+            result_by_idx = dict(zip(need_idx, results))
+        for i, (frame_no, frame, dt_box, rec_res) in enumerate(items):
+            if i in result_by_idx:
+                dt_box, rec_res = result_by_idx[i]
+            data['i'] = frame_no
+            extract_subtitles(data, text_recogniser, frame, raw_subtitles, sub_area, options, dt_box,
+                              rec_res, ocr_loss_debug_path, sub_area_local)
+            processed_count += 1
+            progress_queue.put((frame_no, processed_count))
+
     try:
         while True:
             try:
-                frame_no, frame, dt_box, rec_res = ocr_queue.get(block=True)
-                if frame_no == -1:
+                first = ocr_queue.get(block=True)
+                if first[0] == -1:
                     # frame 是生产者统计的总帧数
-                    total_tasks = frame if frame is not None else processed_count
+                    total_tasks = first[1] if first[1] is not None else processed_count
                     progress_queue.put((-1, total_tasks))
                     return
-                data['i'] = frame_no
-                # 只有上游没给识别结果时才需要模型（懒加载，见上面的说明）
-                if (dt_box is None or rec_res is None) and text_recogniser is None:
-                    text_recogniser = OcrRecogniser()
-                    text_recogniser.hardware_accelerator = options.HARDWARD_ACCELERATOR
-                extract_subtitles(data, text_recogniser, frame, raw_subtitles, sub_area, options, dt_box,
-                                    rec_res, ocr_loss_debug_path, sub_area_local)
-                processed_count += 1
-                progress_queue.put((frame_no, processed_count))
+                items = [first]
+                end_item = None
+                if batch_size > 1:
+                    # 攒满一批再识别；队列暂时空时最多等 50ms，避免尾部几帧拖住收尾。
+                    deadline = time.monotonic() + 0.05
+                    while len(items) < batch_size:
+                        try:
+                            item = ocr_queue.get_nowait()
+                        except queue.Empty:
+                            if time.monotonic() >= deadline:
+                                break
+                            time.sleep(0.002)
+                            continue
+                        if item[0] == -1:
+                            end_item = item
+                            break
+                        items.append(item)
+                process_items(items)
+                if end_item is not None:
+                    total_tasks = end_item[1] if end_item[1] is not None else processed_count
+                    progress_queue.put((-1, total_tasks))
+                    return
             except Exception as e:
                 # 这里不能只 print(e)：打包版 stdout 是 GBK 时 print 自身就会抛
                 # UnicodeEncodeError，把整个消费线程打死而生产者继续入队 →

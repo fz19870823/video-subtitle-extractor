@@ -1,4 +1,5 @@
 import os
+import traceback
 from backend.config import *
 import importlib
 from paddleocr import PaddleOCR
@@ -7,8 +8,12 @@ from backend.tools.paddle_model_config import PaddleModelConfig
 
 # 加载文本检测+识别模型
 class OcrRecogniser:
-    def __init__(self):
+    def __init__(self, batch_size=None):
         self.recogniser = None
+        # 一次送进 det+rec pipeline 的图片张数。1 或 None 表示逐张（历史行为）。
+        # 批量只在"同一视频、同一裁剪矩形"下安全：尺寸一致，det 才能 stack 成一个 batch。
+        self.batch_size = batch_size
+        self._batch_size_applied = False
         # rec-only 路径用到的识别子模型（paddlex TextRecRunnerPredictor），首次使用时解析
         self._rec_model = None
         self._rec_model_checked = False
@@ -27,23 +32,69 @@ class OcrRecogniser:
             return y_max
 
     def predict(self, image):
-        if not self.recogniser:
-            self.recogniser = self.init_model()
-
-        # PaddleOCR 3.x: 使用 predict_iter 获取结果
-        results = list(self.recogniser.predict_iter(image))
+        results = self._predict_raw([image])
         if not results:
             return [], []
+        return self._parse_result(results[0])
 
-        res = results[0]
+    def predict_batch(self, images):
+        """
+        一次把多张图送进 det+rec pipeline（paddlex 内部按 batch 并行推理）。
+        比逐张调用省掉大量 Python/显存同步开销，GPU 利用率明显更高。
+
+        :param images: 图像序列，必须是同一尺寸（同一视频的同一裁剪矩形天然满足）
+        :return: 与 images 等长的 [(dt_box, rec_res), ...]，格式与 predict() 一致
+        """
+        images = list(images)
+        if not images:
+            return []
+        if len(images) == 1:
+            return [self.predict(images[0])]
+        results = self._predict_raw(images)
+        if len(results) != len(images):
+            # 结果条数对不上时退回逐张，保证不会错位
+            return [self.predict(img) for img in images]
+        return [self._parse_result(res) for res in results]
+
+    def _predict_raw(self, images):
+        if not self.recogniser:
+            self.recogniser = self.init_model()
+            self._apply_batch_size()
+        return list(self.recogniser.predict_iter(images))
+
+    def _parse_result(self, res):
+        """paddlex 的单图结果 → 历史格式 (dt_box, rec_res)"""
+        if not res or 'error' in res:
+            return [], []
         dt_polys = res.get('dt_polys', [])
-        rec_texts = res.get('rec_texts', [])
-        rec_scores = res.get('rec_scores', [])
-
         if len(dt_polys) == 0:
             return [], []
+        return self._format_result(dt_polys, res.get('rec_texts', []), res.get('rec_scores', []))
 
-        return self._format_result(dt_polys, rec_texts, rec_scores)
+    def _apply_batch_size(self):
+        """
+        把 batch_size 下推到 paddlex 的 pipeline 与 det/rec 两个子模型。
+        PaddleOCR 的构造参数里没有顶层 batch_size（它只在 paddlex config 里），
+        所以模型建好之后直接改 batch_sampler 的 batch_size 最省事、也不用重载模型。
+        """
+        if self._batch_size_applied:
+            return
+        self._batch_size_applied = True
+        n = self.batch_size
+        if not n or n <= 1:
+            return
+        try:
+            pipeline = getattr(self.recogniser.paddlex_pipeline, '_pipeline', None)
+            if pipeline is None:
+                return
+            if hasattr(pipeline, 'batch_sampler'):
+                pipeline.batch_sampler.batch_size = n
+            for attr in ('text_det_model', 'text_rec_model'):
+                model = getattr(pipeline, attr, None)
+                if model is not None and hasattr(model, 'batch_sampler'):
+                    model.batch_sampler.batch_size = n
+        except Exception:
+            traceback.print_exc()
 
     def _format_result(self, dt_polys, rec_texts, rec_scores):
         """
@@ -187,6 +238,13 @@ class OcrRecogniser:
             text_rec_score_thresh=0,
             device=device,
         )
+        # 每张图里同时识别的文本框数量（显存越大可以越大），默认 6 与模型自带一致
+        try:
+            rec_batch = int(config.recBatchNumber.value)
+        except Exception:
+            rec_batch = 0
+        if rec_batch > 0:
+            kwargs['text_recognition_batch_size'] = rec_batch
         # Paddle 3.x 在 CPU 上启用 oneDNN + PIR 新执行器时会抛
         # NotImplementedError: ConvertPirAttribute2RuntimeAttribute not support，
         # 关闭 mkldnn 可绕过（GPU 不走该分支，无需设置）

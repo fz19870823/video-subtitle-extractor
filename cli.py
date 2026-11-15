@@ -38,6 +38,8 @@ def build_parser():
                    help='强制单一语言：识别结果不是 --lang 指定的语言就丢弃'
                         '（过滤招牌/台标/外文logo）')
     p.add_argument('--no-hwaccel', action='store_true', help='禁用硬件加速')
+    p.add_argument('--batch', type=int, default=None,
+                   help='OCR 批量帧数（一次送进检测+识别模型的图片数），不填则读配置 MaxBatchSize')
     p.add_argument('--debug-state', action='store_true',
                    help='写 state_events.log（含跳帧统计）')
     p.add_argument('--via-gui-pipeline', action='store_true',
@@ -126,6 +128,9 @@ def main(argv=None):
     # 与 --mode / --lang 一致：命令行是唯一来源，不传即关闭（否则配置文件里的
     # 旧值会静默影响本次运行的结果）
     _set(config.forceSingleLanguage, bool(args.force_lang))
+    if args.batch:
+        # 只影响本次运行，不写回配置文件
+        os.environ['VSE_MAX_BATCH'] = str(max(1, int(args.batch)))
     if args.no_hwaccel:
         _set(config.hardwareAcceleration, False)
 
@@ -141,6 +146,10 @@ def main(argv=None):
     print(f'[INFO] video={args.video}')
     print(f'[INFO] mode={args.mode} lang={args.lang} area={args.area or "auto"} '
           f'hwaccel={not args.no_hwaccel}')
+
+    if args.via_gui_pipeline:
+        # 诊断用：走图形界面同一条多进程链路，能复现"控制台完成但界面判失败"这类问题
+        return _run_via_gui_pipeline(args, area)
 
     se = SubtitleExtractor(args.video)
     se.sub_area = area
