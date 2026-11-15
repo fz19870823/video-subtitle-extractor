@@ -390,11 +390,14 @@ $RECYCLE.BIN/
 
 # PyInstaller 打包产物（release*/_internal 各约 5GB，不入库）
 /build/
+/build_*/
 /build_pyi*.log
 /release/
+/release_*/
 /release_out*/
 /release_v*/
 /vse-cli.spec.bak
 
 # 打包配置需要入库（上面的 *.spec 是通用忽略）
 !/vse_cli.spec
+!/vse.spec

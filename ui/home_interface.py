@@ -1,4 +1,5 @@
 import os
+import sys
 import cv2
 import threading
 import multiprocessing
@@ -411,6 +412,12 @@ class HomeInterface(QWidget):
         """
         sr = None
         try:
+            # 打包环境里 OCR 的 multiprocessing 子进程起不来（卡在 paddle/CUDA
+            # dll 加载，永远不消费队列），必须在 import backend.main 之前换成
+            # 同进程线程。源码运行不受影响。
+            from backend.tools.frozen_runtime import single_process_ocr_enabled, apply_single_process_ocr
+            if single_process_ocr_enabled():
+                apply_single_process_ocr()
             from backend.main import SubtitleExtractor
             sr = SubtitleExtractor(video_path)
             sr.subtitle_output_path = output_path

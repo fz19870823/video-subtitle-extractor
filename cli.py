@@ -11,32 +11,13 @@
 """
 import os
 
-# 打包后 sys.frozen 为 True，此时以 exe 所在目录为工作目录，
-# 保证 config/config.json、output/ 等相对路径行为与源码目录一致。
-if getattr(__import__('sys'), 'frozen', False):
-    import sys as _sys_frozen
-    import shutil as _shutil
-    _EXE_DIR = os.path.dirname(os.path.abspath(_sys_frozen.executable))
-    os.chdir(_EXE_DIR)
-    os.environ.setdefault('PADDLE_PDX_CACHE_HOME', os.path.join(_EXE_DIR, '.paddlex'))
-    # Windows 控制台/重定向默认用 GBK（cp936）。OCR 文本里出现 © 这类字符时
-    # print 会抛 UnicodeEncodeError，曾把 OCR 消费线程整个打死（producer 随后撑满
-    # 队列永久阻塞，主进程 join 挂死）。统一按 UTF-8 输出，无法编码的字符转义。
-    for _stream in (_sys_frozen.stdout, _sys_frozen.stderr):
-        try:
-            _stream.reconfigure(encoding='utf-8', errors='backslashreplace')
-        except Exception:
-            pass
-    # CONFIG_FILE 是相对 cwd 的 'config/config.json'，目录必须存在；
-    # 首次运行把打包进 _internal 的默认配置复制到 exe 同级，之后用户改的就是这份。
-    try:
-        os.makedirs(os.path.join(_EXE_DIR, 'config'), exist_ok=True)
-        _dst_cfg = os.path.join(_EXE_DIR, 'config', 'config.json')
-        _src_cfg = os.path.join(getattr(_sys_frozen, '_MEIPASS', _EXE_DIR), 'config', 'config.json')
-        if not os.path.exists(_dst_cfg) and os.path.exists(_src_cfg):
-            _shutil.copyfile(_src_cfg, _dst_cfg)
-    except Exception:
-        pass
+from backend.tools.frozen_runtime import (
+    prepare_frozen_environment, apply_single_process_ocr, single_process_ocr_enabled,
+)
+
+# 打包后 sys.frozen 为 True：以 exe 所在目录为工作目录，stdio 转 UTF-8，
+# 并把默认 config/config.json 复制到 exe 同级（详见 frozen_runtime 模块注释）。
+prepare_frozen_environment()
 # 跳过 paddlex 联网检查模型源，避免离线环境启动卡顿
 os.environ.setdefault('PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK', 'True')
 
@@ -55,78 +36,41 @@ def build_parser():
     p.add_argument('--no-hwaccel', action='store_true', help='禁用硬件加速')
     p.add_argument('--debug-state', action='store_true',
                    help='写 state_events.log（含跳帧统计）')
+    p.add_argument('--via-gui-pipeline', action='store_true',
+                   help='用图形界面相同的多进程链路执行（诊断打包环境用）')
     return p
 
 
+def _run_via_gui_pipeline(args, area):
+    """按图形界面的调用链跑一次提取：multiprocessing 子进程 + 队列回调。
+
+    界面上点「运行」走的就是这条链路（HomeInterface.run_subtitle_extractor_process）。
+    打包后用它验证 spawn 子进程、队列通信、子进程内的 OCR 线程是否都正常。
+    """
+    import multiprocessing
+    from ui.home_interface import HomeInterface
+    from backend.tools.subtitle_extractor_remote_call import SubtitleExtractorRemoteCall
+
+    caller = SubtitleExtractorRemoteCall()
+    caller.register_log_callback(lambda *a: print('[child]', *a, flush=True))
+    caller.register_error_callback(lambda e: print('[child][ERROR]', repr(e), flush=True))
+    caller.register_update_progress_callback(lambda *a: None)
+    caller.register_manage_process_callback(lambda pid: None)
+
+    proc = multiprocessing.Process(
+        target=HomeInterface.extractor_process,
+        args=(caller.queue, args.video, args.output, {'sub_area': area, 'ab_sections': None}),
+    )
+    proc.start()
+    proc.join()
+    print(f'[INFO] child_exitcode={proc.exitcode}', flush=True)
+    caller.stop()
+    return 0 if proc.exitcode == 0 else 3
+
+
 def _patch_ocr_single_process():
-    """
-    冻结环境（PyInstaller）下用同进程线程替代 multiprocessing 子进程。
-
-    原因：打包后 OCR 子进程需要重新加载整套 paddle/CUDA dll，实测会卡在启动阶段
-    完全不消费任务队列，而主进程在 `subtitle_ocr_process.join()` 上无限等待
-    （整集 34056 帧跑到 100% 后永久挂住，子进程 CPU 停在 4.9s）。
-    线程版走完全相同的 producer/consumer 逻辑，接口与 Process 兼容，避开 mp 启动问题。
-    """
-    import queue as _queue
-    from threading import Thread
-    from types import SimpleNamespace
-    from backend.tools import subtitle_ocr as _so
-
-    class _ThreadProcess:
-        """模拟 multiprocessing.Process 的最小接口（ProcessManager 会读 pid 并 join）"""
-
-        def __init__(self, thread):
-            self._t = thread
-            self.pid = os.getpid()
-
-        def join(self, timeout=None):
-            self._t.join(timeout)
-
-        def is_alive(self):
-            return self._t.is_alive()
-
-        def terminate(self):
-            pass
-
-    _required = ('REC_CHAR_TYPE', 'DROP_SCORE', 'SUB_AREA_DEVIATION_RATE',
-                 'DEBUG_OCR_LOSS', 'HARDWARD_ACCELERATOR')
-
-    def _local_async_start(video_path, raw_subtitle_path, sub_area, options):
-        for key in _required:
-            assert key in options, f'options缺少参数：{key}'
-        task_queue = _queue.Queue()
-        progress_queue = _queue.Queue()
-        t = Thread(
-            target=_so.subtitle_extract_handler,
-            name='subtitle-ocr-local',
-            args=(task_queue, progress_queue, video_path, raw_subtitle_path,
-                  sub_area, SimpleNamespace(**options)),
-            daemon=True,
-        )
-        t.start()
-        return _ThreadProcess(t), task_queue, progress_queue
-
-    _so.async_start = _local_async_start
-
-    # 同进程里主线程与 OCR 线程各有一套 predictor，并发调用 CUDA 会直接死锁
-    # （实测主进程 CPU 停住、join 永久阻塞）。给 OcrRecogniser 的构造与推理加
-    # 类级可重入锁，让两者串行使用 GPU。多进程模式下不存在这个问题，故只在回退时加。
-    import threading
-    from backend.tools.ocr import OcrRecogniser as _OR
-    if not getattr(_OR, '_vse_locked', False):
-        _gpu_lock = threading.RLock()
-        for _name in ('__init__', 'predict', 'recognise_polys', 'init_model'):
-            _orig = getattr(_OR, _name)
-
-            def _make(orig):
-                def _wrapped(self, *a, **k):
-                    with _gpu_lock:
-                        return orig(self, *a, **k)
-                _wrapped.__name__ = getattr(orig, '__name__', 'wrapped')
-                return _wrapped
-
-            setattr(_OR, _name, _make(_orig))
-        _OR._vse_locked = True
+    """兼容旧调用：实现已移到 backend/tools/frozen_runtime.py（GUI 共用同一份）。"""
+    apply_single_process_ocr()
 
 
 def main(argv=None):
@@ -159,8 +103,8 @@ def main(argv=None):
 
     # 冻结环境默认用同进程线程跑 OCR（mp 子进程在打包后起不来）；
     # 源码环境可用 VSE_SINGLE_PROCESS=1 复现同一路径，便于对照验证。
-    if getattr(sys, 'frozen', False) or os.environ.get('VSE_SINGLE_PROCESS') == '1':
-        _patch_ocr_single_process()
+    if single_process_ocr_enabled():
+        apply_single_process_ocr()
 
     config.set(config.mode, args.mode)
     config.set(config.debugNoDeleteCache, False)
