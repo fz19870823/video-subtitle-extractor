@@ -40,6 +40,20 @@ import multiprocessing
 import time
 import pysrt
 
+def _max_batch_size():
+    """OCR 帧批量大小：VSE_MAX_BATCH 环境变量优先（做 A/B 对比用），否则读配置。"""
+    env = os.environ.get('VSE_MAX_BATCH')
+    if env:
+        try:
+            return max(1, int(env))
+        except ValueError:
+            pass
+    try:
+        return max(1, int(config.maxBatchSize.value))
+    except Exception:
+        return 1
+
+
 class SubtitleExtractor:
     """
     视频字幕提取类
@@ -202,8 +216,10 @@ class SubtitleExtractor:
             reformat.execute(self.subtitle_output_path, config.language.value)
         self.append_output(tr['Main']['FinishGenerateSub'], f"{round(time.time() - start_time, 2)}s")
         self.append_output('-----------------------------')
-        self.update_progress(ocr=100, frame_extract=100, post=100)
+        # isFinished 必须在最后一次 update_progress 之前置位：GUI 是靠进度回调里的
+        # isFinished 判定"流程真的走完了"的，先发进度再置位会让 GUI 永远收不到完成信号。
         self.isFinished = True
+        self.update_progress(ocr=100, frame_extract=100, post=100)
         # 删除缓存文件
         self.empty_cache()
         self.lock.release()
@@ -1704,6 +1720,8 @@ class SubtitleExtractor:
             'SUB_AREA_DEVIATION_RATE': config.subtitleAreaDeviationRate.value / 100.0,
             'DEBUG_OCR_LOSS': config.debugOcrLoss.value,
             'HARDWARD_ACCELERATOR': self.hardware_accelerator,
+            # 一次送进 OCR 的帧数（快速模式/无预检测结果时才生效）
+            'MAX_BATCH_SIZE': _max_batch_size(),
         }
         process, task_queue, progress_queue = subtitle_ocr.async_start(self.video_path, self.raw_subtitle_path, self.sub_area, options)
         ProcessManager.instance().add_process(process)

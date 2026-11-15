@@ -18,6 +18,15 @@ from backend.config import config, tr
 from backend.tools.subtitle_extractor_remote_call import SubtitleExtractorRemoteCall
 from backend.tools.process_manager import ProcessManager
 
+def _file_snapshot(path):
+    """(mtime_ns, size)；文件不存在返回 None。用于判断本次运行有没有真的写出产物。"""
+    try:
+        st = os.stat(path)
+        return st.st_mtime_ns, st.st_size
+    except OSError:
+        return None
+
+
 class HomeInterface(QWidget):
     progress_signal = Signal(int, int, int, bool, int) 
     append_log_signal = Signal(list)
@@ -363,17 +372,38 @@ class HomeInterface(QWidget):
                             # 清理缓存, 使用动态路径
                             task.output_path = None
                             output_path = task.output_path
+                            # 记下本次任务的索引：后面的进度回调（isFinished）可能把
+                            # current_processing_task_index 重置成 -1，再用它取任务会拿到 None，
+                            # 从而把明明已经完成的任务误判成失败。
+                            task_index = self.current_processing_task_index
+                            # 记录运行前的产物快照：判"有没有真的产出"要比对修改时间，
+                            # 否则同名旧 srt 还在就会被误认为本次成功
+                            before = _file_snapshot(output_path)
                             process = self.run_subtitle_extractor_process(task.path, output_path, options)
-                            
+
                             # 更新任务状态为已完成
-                            task = self.task_list_component.get_task(self.current_processing_task_index)
-                            if process.exitcode == 0 and task and task.status == TaskStatus.PROCESSING:
+                            current_task = self.task_list_component.get_task(task_index)
+                            still_processing = current_task is not None and current_task.status == TaskStatus.PROCESSING
+                            # 退出码为 0 是正常完成。少数情况下推理库在解释器退出阶段崩溃
+                            # （CUDA 上下文析构），日志已经打完、字幕文件也已生成，但退出码非 0，
+                            # 这时以"本次是否真的写出产物"作为兜底判据，避免误报失败。
+                            after = _file_snapshot(output_path)
+                            produced = after is not None and after[1] > 0 and after != before
+                            ok = still_processing and (process.exitcode == 0 or produced)
+                            if ok:
                                 self.progress_signal.emit(100, 100, 100, True, 100)
                                 # 任务完成, 更新输出路径为只读
-                                task.output_path = output_path
-                                self.task_list_component.update_task_status(self.current_processing_task_index, TaskStatus.COMPLETED)
-                            else:
-                                self.task_list_component.update_task_status(self.current_processing_task_index, TaskStatus.FAILED)
+                                if current_task:
+                                    current_task.output_path = output_path
+                                self.task_list_component.update_task_status(task_index, TaskStatus.COMPLETED)
+                                if process.exitcode != 0:
+                                    self.append_output(
+                                        f"  【警告】子进程退出码 {process.exitcode}，但字幕文件已正常生成，按完成处理")
+                            elif still_processing:
+                                self.append_output(
+                                    f"  【错误】子进程退出码 {process.exitcode}，未生成字幕文件：{output_path}")
+                                self.task_list_component.update_task_status(task_index, TaskStatus.FAILED)
+                            # 任务已由 error 回调标记为失败时不再重复处理
                             
                         except Exception as e:
                             print(e)
@@ -411,6 +441,7 @@ class HomeInterface(QWidget):
             options: 选项
         """
         sr = None
+        ok = False
         try:
             # 打包环境里 OCR 的 multiprocessing 子进程起不来（卡在 paddle/CUDA
             # dll 加载，永远不消费队列），必须在 import backend.main 之前换成
@@ -427,6 +458,7 @@ class HomeInterface(QWidget):
             sr.append_output = lambda *args: SubtitleExtractorRemoteCall.remote_call_append_log(queue, args)
             sr.manage_process = lambda pid: SubtitleExtractorRemoteCall.remote_call_manage_process(queue, pid)
             sr.run()
+            ok = True
         except Exception as e:
             traceback.print_exc()
             SubtitleExtractorRemoteCall.remote_call_catch_error(queue, e)
@@ -436,7 +468,23 @@ class HomeInterface(QWidget):
                 sr.vsf_running = False
             SubtitleExtractorRemoteCall.remote_call_finish(queue)
             ProcessManager.instance().terminate_all()
-            
+
+        # 显式退出：paddle / CUDA 在解释器退出阶段析构时偶发崩溃（Windows 上通常是
+        # 0xC0000005），退出码变成非 0，GUI 就会把已经跑完、字幕也生成好的任务标成失败。
+        # 这里先把标准输出和队列缓冲刷干净（finish 消息必须真正写进管道），
+        # 再用 os._exit 跳过解释器清理，退出码只反映业务是否成功。
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        try:
+            queue.close()
+            queue.join_thread()
+        except Exception:
+            pass
+        os._exit(0 if ok else 1)
+
 
     # 修改run_subtitle_extractor_process方法
     def run_subtitle_extractor_process(self, video_path, output_path, options):
