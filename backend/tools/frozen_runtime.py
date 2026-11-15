@@ -110,6 +110,13 @@ def apply_single_process_ocr():
     class _ThreadProcess:
         """模拟 multiprocessing.Process 的最小接口（ProcessManager 会读 pid 并 join）"""
 
+        # 关键标记：这不是真进程，pid 只能填自己（os.getpid()）。
+        # 如果被 ProcessManager 收进去，terminate_all() 会执行
+        # `taskkill /F /T /PID <自己的 pid>` 把当前进程直接杀掉——
+        # 现象就是日志全部打完、字幕也生成好，但子进程退出码非 0，
+        # 界面把任务判成失败。调用方必须跳过这种对象。
+        is_local_thread = True
+
         def __init__(self, thread):
             self._t = thread
             self.pid = os.getpid()
@@ -121,6 +128,9 @@ def apply_single_process_ocr():
             return self._t.is_alive()
 
         def terminate(self):
+            pass
+
+        def kill(self):
             pass
 
     _required = ('REC_CHAR_TYPE', 'DROP_SCORE', 'SUB_AREA_DEVIATION_RATE',

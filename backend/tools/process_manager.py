@@ -120,6 +120,10 @@ class ProcessManager:
         self.terminate_by_pid(process.pid)
 
     def terminate_by_pid(self, pid):
+        # 永远不要杀自己：打包环境下 OCR 用线程代替子进程，假进程的 pid 就是本进程，
+        # 曾经因此让子进程在"任务已完成"之后被 taskkill 掉，退出码非 0，界面误判失败。
+        if not pid or pid == os.getpid():
+            return
         try:
             # 使用系统命令强制终止进程
             if platform.system() == 'Windows':

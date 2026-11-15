@@ -1724,8 +1724,12 @@ class SubtitleExtractor:
             'MAX_BATCH_SIZE': _max_batch_size(),
         }
         process, task_queue, progress_queue = subtitle_ocr.async_start(self.video_path, self.raw_subtitle_path, self.sub_area, options)
-        ProcessManager.instance().add_process(process)
-        self.manage_process(process.pid)
+        # 打包版 OCR 是"假进程"（就是本进程里的一个线程），pid 等于自己。
+        # 一旦被 ProcessManager 收进去，收尾的 terminate_all() 会 taskkill 自己，
+        # 导致日志打完、字幕生成好，退出码却是非 0，界面误判失败。
+        if not getattr(process, 'is_local_thread', False):
+            ProcessManager.instance().add_process(process)
+            self.manage_process(process.pid)
         self.subtitle_ocr_task_queue = task_queue
         self.subtitle_ocr_progress_queue = progress_queue
         # 开启线程负责更新OCR进度
