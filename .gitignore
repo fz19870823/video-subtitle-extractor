@@ -392,6 +392,7 @@ $RECYCLE.BIN/
 /build/
 /build_*/
 /build_pyi*.log
+/build_release.log
 /release/
 /release_*/
 /release_out*/

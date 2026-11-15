@@ -50,6 +50,9 @@ class Config(QConfig):
 
     # 字幕语言设置
     language = OptionsConfigItem("Main", "Language", "ch", OptionsValidator([name for name in tr["Language"]]))
+    # 强制单一语言：开启后按所选语言判断文字系统，非该语言的识别结果直接丢弃
+    # （招牌 / 台标 / 道具文字 / 片名 logo 这类经常被误识别成字幕）
+    forceSingleLanguage = ConfigItem("Main", "ForceSingleLanguage", False, BoolValidator())
     # 识别模式设置
     mode = OptionsConfigItem("Main", "Mode", "fast",  OptionsValidator(["auto", "fast", "accurate"]))
     # 是否生成TXT文本字幕

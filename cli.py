@@ -34,6 +34,9 @@ def build_parser():
                    help='提取模式，默认 accurate（精准）。auto 在有 GPU 时等同 accurate，'
                         '无 GPU 时退回 fast')
     p.add_argument('--lang', default='ch', help='字幕语言，默认 ch')
+    p.add_argument('--force-lang', action='store_true',
+                   help='强制单一语言：识别结果不是 --lang 指定的语言就丢弃'
+                        '（过滤招牌/台标/外文logo）')
     p.add_argument('--no-hwaccel', action='store_true', help='禁用硬件加速')
     p.add_argument('--debug-state', action='store_true',
                    help='写 state_events.log（含跳帧统计）')
@@ -120,6 +123,9 @@ def main(argv=None):
     _set(config.debugNoDeleteCache, False)
     _set(config.wordSegmentation, False)
     _set(config.language, args.lang)
+    # 与 --mode / --lang 一致：命令行是唯一来源，不传即关闭（否则配置文件里的
+    # 旧值会静默影响本次运行的结果）
+    _set(config.forceSingleLanguage, bool(args.force_lang))
     if args.no_hwaccel:
         _set(config.hardwareAcceleration, False)
 

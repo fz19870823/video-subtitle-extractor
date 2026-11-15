@@ -35,6 +35,16 @@ class SettingInterface(QtWidgets.QVBoxLayout):
         )
         self.addWidget(self.language_combo)
 
+        # 强制单一语言：识别结果不是所选语言就丢弃（招牌、台标、片名 logo 常被误识别成字幕）
+        self.force_language_switch = SwitchSettingCard(
+            configItem=config.forceSingleLanguage,
+            icon=FluentIcon.FILTER,
+            title=tr["Setting"]["ForceSingleLanguage"],
+            content=tr["Setting"]["ForceSingleLanguageDesc"],
+            parent=parent
+        )
+        self.addWidget(self.force_language_switch)
+
         # 识别模式设置
         self.mode_combo = ComboBoxSettingCard(
             configItem=config.mode,

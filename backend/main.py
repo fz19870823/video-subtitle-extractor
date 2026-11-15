@@ -31,6 +31,7 @@ from backend.tools.ocr import OcrRecogniser, get_coordinates
 from backend.tools import subtitle_ocr
 from backend.tools.paddle_model_config import PaddleModelConfig
 from backend.tools.process_manager import ProcessManager
+from backend.tools.language_filter import is_target_language
 from backend.tools.subtitle_detect import SubtitleDetect
 from backend.bean.subtitle_area import SubtitleArea
 import threading
@@ -872,6 +873,7 @@ class SubtitleExtractor:
             lines = r.readlines()
         RawInfo = namedtuple('RawInfo', 'no content')
         content_list = []
+        lang_dropped = 0
         for line in lines:
             parts = line.split('\t')
             if len(parts) < 3:
@@ -882,7 +884,14 @@ class SubtitleExtractor:
             # 这里丢掉纯噪声行，避免 'T' / 'oo' / logo 文本变成字幕条目
             if self.NOISE_FILTER and self._is_noise_text(content):
                 continue
+            # 同一层兜底：子进程自识别的行也要过语言过滤，否则 '¥750'、'J.C.STAFF'
+            # 这类非目标语言内容会绕过 _filter_noise_boxes 直接进 raw
+            if self.LANG_FILTER and self._is_wrong_language(content):
+                lang_dropped += 1
+                continue
             content_list.append(RawInfo(frame_no, content))
+        if lang_dropped:
+            self.append_output(f'强制单一语言：丢弃 {lang_dropped} 行非「{config.language.value}」识别结果')
         # 去重后的字幕列表
         unique_subtitle_list = []
         idx_i = 0
@@ -944,6 +953,11 @@ class SubtitleExtractor:
         with open(self.raw_subtitle_path, mode='w', encoding='utf-8') as f:
             for frame_no, (coordinate, contents) in grouped.items():
                 merged = ' '.join(contents).replace('\n', ' ')
+                if self.LANG_FILTER and self._is_wrong_language(merged):
+                    # 整帧都不是目标语言 → 该帧不写回 raw，下游自然不会产出条目。
+                    # 判定放在合并之后：同一帧里 'Level 5' 和中文台词是两个框，
+                    # 拼起来是一行有效字幕，不能逐框丢。
+                    continue
                 if self.NOISE_FILTER:
                     # 同一帧有多个框时上面是按 ' '.join 拼的，如果两个框识别出同一句，
                     # 拼完就是 'A A'。主进程的 _filter_noise_boxes 只处理单帧内的框，
@@ -1040,6 +1054,12 @@ class SubtitleExtractor:
             # 全是噪声时原样返回：是否算作字幕由调用方的 _is_noise_text 统一判定
             if kept:
                 area_text = kept
+        # 强制单一语言：非目标语言的行不算字幕。整帧只剩外文招牌时 area_text 变空，
+        # 上游 has_subtitle 会因此判为无字幕，不会为这一帧产出条目。
+        # 按"整行"判定而不是逐框：det 常把一句拆成中文框 + 英文框
+        # （'Level 5' + '7名超能力者的第三位'），逐框过滤会把 'Level 5' 单独删掉。
+        if self.LANG_FILTER and area_text and self._is_wrong_language(''.join(area_text)):
+            return []
         return area_text
 
     @staticmethod
@@ -1062,6 +1082,22 @@ class SubtitleExtractor:
         if not any(ch.isalnum() for ch in t):
             return True                      # '...' / '—' / '·'
         return False
+
+    @classmethod
+    def _is_wrong_language(cls, text):
+        """
+        强制单一语言：判断这行是不是"非所选语言"的识别结果。
+        未开启 config.forceSingleLanguage（或语言未收录）时恒为 False，不影响原有行为。
+        """
+        if not cls.LANG_FILTER:
+            return False
+        try:
+            if not config.forceSingleLanguage.value:
+                return False
+            lang = config.language.value
+        except Exception:
+            return False
+        return not is_target_language(text, lang)
 
     @staticmethod
     def _take_flush_result(compare_cache, entry_by_frame, frame_no, dbg=None):
@@ -1109,6 +1145,9 @@ class SubtitleExtractor:
     # 环境变量可分别关闭，便于回归对比：VSE_MERGE_LINE=0 / VSE_NOISE_FILTER=0
     MERGE_SAME_LINE = os.environ.get('VSE_MERGE_LINE', '1') == '1'
     NOISE_FILTER = os.environ.get('VSE_NOISE_FILTER', '1') == '1'
+    # 强制单一语言的总开关（真正是否生效还要看 config.forceSingleLanguage）。
+    # 环境变量 VSE_LANG_FILTER=0 可临时关掉，便于回归对比。
+    LANG_FILTER = os.environ.get('VSE_LANG_FILTER', '1') == '1'
 
     # ---- 管道解码参数 ----
     # 精确模式只需要字幕条上的像素，整帧 4K 每帧 24MB 的 YUV→BGR 转换和 Mat 拷贝是纯浪费。
@@ -1484,6 +1523,11 @@ class SubtitleExtractor:
                     break
             if not duplicated:
                 keep.append((box, text, score))
+        # 强制单一语言：按"整帧一行"判断。整帧文本都不是目标语言时才清空，
+        # 而不是逐框删——det 常把一句拆成中文框 + 英文框（'Level 5' + '7名超能力者的第三位'），
+        # 逐框过滤会把 'Level 5' 这种句中成分一起删掉。
+        if keep and cls.LANG_FILTER and cls._is_wrong_language(''.join(t for _, t, _ in keep)):
+            return [], []
         return [b for b, _, _ in keep], [(t, s) for _, t, s in keep]
 
     @staticmethod
