@@ -39,8 +39,10 @@ echo "==> PyInstaller 构建（约 10 分钟）"
 "$PY" -m PyInstaller --noconfirm --distpath tmp/_stage --workpath build/pyi vse.spec
 
 echo "==> 交换产物到 release/vse"
-if [ -d release ]; then
-    mv release tmp/_release_old
+# 只在 release/vse 这一级做替换：顶层 release 目录有时被资源管理器/编辑器占着句柄，
+# 整个目录 rename 会 Permission denied；vse 子目录本身还是能换的。
+if [ -d release/vse ]; then
+    mv release/vse tmp/_release_old
 fi
 mkdir -p release
 mv tmp/_stage/vse release/vse
