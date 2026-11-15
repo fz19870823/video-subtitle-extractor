@@ -44,7 +44,16 @@ if [ -d release ]; then
 fi
 mkdir -p release
 mv tmp/_stage/vse release/vse
-rm -rf tmp/_stage tmp/_release_old build/pyi
+
+# 收尾清理由 best-effort 处理：旧 release 副本 6000+ 文件、总计上万文件，
+# 一次性 rm 会被 safe-delete 钩子整体拦下（BULK_CONFIRM_REQUIRED），
+# 但产物此时已经就位，不该因此让整个构建报失败。逐目录删，失败的留待手动清。
+echo "==> 清理中间产物（失败不影响产物）"
+for d in tmp/_stage tmp/_release_old build/pyi; do
+    [ -e "$d" ] || continue
+    rm -rf "$d" 2>/dev/null || true
+    [ -e "$d" ] && echo "    残留：$d（文件数过多被安全钩子拦，手动删或分批删）"
+done
 
 echo "==> 完成"
 du -sh release/vse

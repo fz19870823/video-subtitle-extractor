@@ -40,7 +40,7 @@ def main():
     check('中英混排保留', is_target_language('Level 5 超能力者', 'japan'), True)
     check('纯繁体保留', is_target_language('就算是我的錯', 'japan'), True)
     check('英文招牌应丢', is_target_language('J.C.STAFF', 'japan'), False)
-    check('数字价格应丢', is_target_language('¥750', 'japan'), False)
+    check('数字价格保留', is_target_language('¥750', 'japan'), True)
     check('韩文应丢', is_target_language('안녕하세요', 'japan'), False)
 
     print('\n---- 目标：简体中文 ----')
@@ -49,7 +49,7 @@ def main():
     check('日文假名应丢', is_target_language('そう言った', 'japan') and
           is_target_language('そう言った', 'ch'), False)
     check('英文应丢', is_target_language('Hello world', 'ch'), False)
-    check('纯数字应丢', is_target_language('750', 'ch'), False)
+    check('纯数字保留（语言无关）', is_target_language('750', 'ch'), True)
     check('中文夹英文放行', is_target_language('我们OK的', 'ch'), True)
 
     print('\n---- 目标：繁体中文 ----')
@@ -61,7 +61,7 @@ def main():
     check('英文带重音', is_target_language('Café au lait', 'fr'), True)
     check('越南语声调', is_target_language('Xin chào', 'vi'), True)
     check('中文应丢', is_target_language('你好', 'en'), False)
-    check('纯数字应丢', is_target_language('750', 'en'), False)
+    check('纯数字保留（语言无关）', is_target_language('750', 'en'), True)
 
     print('\n---- 目标：其他文字系统 ----')
     check('韩文', is_target_language('안녕하세요', 'korean'), True)
@@ -72,9 +72,19 @@ def main():
     check('希腊文', is_target_language('Γειά', 'el'), True
           if is_target_language('Γειά', 'el') else False)
 
+    print('\n---- 数字与符号：所有语言都保留 ----')
+    for lang in ('ch', 'chinese_cht', 'japan', 'en', 'korean', 'ru', 'ar'):
+        check(f'{lang} 价格行', is_target_language('¥750', lang), True)
+        check(f'{lang} 纯数字', is_target_language('1234', lang), True)
+        check(f'{lang} 全角感叹', is_target_language('！？', lang), True)
+        check(f'{lang} 时间码样式', is_target_language('12:34', lang), True)
+        check(f'{lang} 数字夹符号', is_target_language('￥1,280-', lang), True)
+        foreign = 'здравствуй' if lang in ('en', 'ch', 'chinese_cht', 'japan') else 'Hello world'
+        check(f'{lang} 外语行仍丢', is_target_language(foreign, lang), False)
+
     print('\n---- 边界 ----')
     check('空文本', is_target_language('', 'japan'), False)
-    check('仅符号', is_target_language('……', 'ch'), False)
+    check('仅符号保留（语言无关）', is_target_language('……', 'ch'), True)
     check('未收录语言不过滤', is_target_language('随便什么', 'zz'), True)
     check('大写字码兼容', is_target_language('そう', 'JAPAN'), True)
 

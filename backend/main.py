@@ -1068,10 +1068,17 @@ class SubtitleExtractor:
         判断一条识别结果是不是噪声（省略号被识成 'oo'、logo 被认成 'T' / '?'）。
         含中日文或数字 → 一定是有效内容；纯拉丁/符号再按长度和重复度收窄，
         避免误伤 'OK' 这类真实短字幕。
+
+        例外：单个字符用空格隔开重复（'1  1' / '1  1  1  1'）是省略号「……」被
+        识别成数字的典型形态，属于噪声。语言过滤放开"纯数字行"之后这类会漏进来，
+        所以在数字早退之前先拦一道——不动 '1' / '10' / '750' 这些真数字。
         """
         t = text.replace(' ', '').strip()
         if not t:
             return True
+        stripped = text.strip()
+        if len(t) > 1 and len(t) <= 4 and len(set(t)) == 1 and len(stripped) > len(t):
+            return True                      # '1  1' / '1  1  1  1' / 'oo oo'
         for ch in t:
             if ch.isdigit() or '\u3040' <= ch <= '\u30ff' or '\u4e00' <= ch <= '\u9fff':
                 return False
