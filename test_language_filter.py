@@ -34,8 +34,11 @@ def main():
     check('日文全角片假名', is_target_language('オーケー', 'japan'), True)
     check('日文纯汉字短句', is_target_language('本当', 'japan'), True)
     check('日文含数字', is_target_language('第1話', 'japan'), True)
-    check('中文台词应丢', is_target_language('就算是我的错', 'japan'), False)
-    check('中文含简体特征应丢', is_target_language('我们自己', 'japan'), False)
+    # 日文目标下汉字行一律保留：汉字在日文里同样是正文用字，中日无法在字形层面区分
+    check('中文台词保留', is_target_language('就算是我的错', 'japan'), True)
+    check('中文含简体特征保留', is_target_language('我们自己', 'japan'), True)
+    check('中英混排保留', is_target_language('Level 5 超能力者', 'japan'), True)
+    check('纯繁体保留', is_target_language('就算是我的錯', 'japan'), True)
     check('英文招牌应丢', is_target_language('J.C.STAFF', 'japan'), False)
     check('数字价格应丢', is_target_language('¥750', 'japan'), False)
     check('韩文应丢', is_target_language('안녕하세요', 'japan'), False)
